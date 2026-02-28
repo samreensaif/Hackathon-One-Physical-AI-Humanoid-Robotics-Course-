@@ -105,6 +105,15 @@ class ChatResponse(BaseModel):
     sources: list[dict[str, Any]]
 
 
+class TranslateRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=50000)
+    target_language: str = Field(default="urdu")
+
+
+class TranslateResponse(BaseModel):
+    translated_text: str
+
+
 # ── RAG prompt builder ──────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
@@ -282,6 +291,33 @@ async def chat_selected(request: ChatSelectedRequest) -> ChatResponse:
         return await _chat_core(request, selected_text=request.selected_text)
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/translate", response_model=TranslateResponse)
+async def translate(request: TranslateRequest) -> TranslateResponse:
+    """Translate text to the target language using GPT-4o-mini."""
+    oai: openai.AsyncOpenAI = app.state.openai
+    try:
+        completion = await oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a professional translator. Translate the following text to "
+                        f"{request.target_language}. Preserve the structure and meaning. "
+                        f"Return only the translated text, nothing else."
+                    ),
+                },
+                {"role": "user", "content": request.text},
+            ],
+            max_tokens=4000,
+            temperature=0.1,
+        )
+        translated = completion.choices[0].message.content or ""
+        return TranslateResponse(translated_text=translated)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
