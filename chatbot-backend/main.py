@@ -114,6 +114,18 @@ class TranslateResponse(BaseModel):
     translated_text: str
 
 
+class PersonalizeRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=50000)
+    experience_level: str = Field(default="Beginner")
+    has_gpu: bool = Field(default=False)
+    used_ros: bool = Field(default=False)
+    learning_style: str = Field(default="Reading")
+
+
+class PersonalizeResponse(BaseModel):
+    personalized_content: str
+
+
 # ── RAG prompt builder ──────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
@@ -291,6 +303,47 @@ async def chat_selected(request: ChatSelectedRequest) -> ChatResponse:
         return await _chat_core(request, selected_text=request.selected_text)
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/personalize", response_model=PersonalizeResponse)
+async def personalize(request: PersonalizeRequest) -> PersonalizeResponse:
+    """Rewrite chapter content adapted to the student's background using GPT-4o-mini."""
+    oai: openai.AsyncOpenAI = app.state.openai
+    system_prompt = (
+        "You are an expert educator specialising in Physical AI and Robotics. "
+        "Rewrite the following course chapter content so it is perfectly suited "
+        "to this student's background:\n\n"
+        f"- Experience level: {request.experience_level}\n"
+        f"- Has NVIDIA GPU: {'Yes' if request.has_gpu else 'No'}\n"
+        f"- Has used ROS before: {'Yes' if request.used_ros else 'No'}\n"
+        f"- Preferred learning style: {request.learning_style}\n\n"
+        "Adaptation rules:\n"
+        "• Beginner: simplify jargon, add plain-English explanations before code, "
+        "use everyday analogies.\n"
+        "• Intermediate: assume standard programming knowledge; keep technical terms "
+        "but explain domain-specific ones.\n"
+        "• Advanced: be concise, use precise terminology, skip basic explanations.\n"
+        "• Visual learner: add ASCII diagrams, describe visual structure, use tables.\n"
+        "• Hands-on learner: lead with code examples and exercises, minimise theory.\n"
+        "• Reading learner: favour detailed prose explanations and context.\n"
+        "• Has GPU: include GPU-specific commands and tips where relevant.\n"
+        "• Used ROS before: reference familiar ROS 1 concepts when introducing ROS 2.\n\n"
+        "Preserve all headings and code blocks. Return only the rewritten content."
+    )
+    try:
+        completion = await oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.content},
+            ],
+            max_tokens=4000,
+            temperature=0.3,
+        )
+        result = completion.choices[0].message.content or ""
+        return PersonalizeResponse(personalized_content=result)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

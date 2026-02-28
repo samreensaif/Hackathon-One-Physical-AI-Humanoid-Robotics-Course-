@@ -1,0 +1,79 @@
+.container {
+  margin: 0.75rem 0 1.5rem;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.personalizeBtn {
+  background: linear-gradient(135deg, #6b46c1, #2e8555);
+  color: #fff;
+  border: none;
+  padding: 0.45rem 1.1rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 600;
+  transition: opacity 0.15s;
+}
+
+.personalizeBtn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.personalizeBtn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.showOriginalBtn {
+  background: transparent;
+  color: var(--ifm-color-emphasis-700);
+  border: 1px solid var(--ifm-color-emphasis-300);
+  padding: 0.35rem 0.85rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+
+.showOriginalBtn:hover {
+  background: var(--ifm-color-emphasis-100);
+}
+
+.badge {
+  display: inline-block;
+  background: var(--ifm-color-primary-lightest, #e6f4ee);
+  color: var(--ifm-color-primary-darkest, #1a5e38);
+  border-radius: 20px;
+  padding: 0.25rem 0.85rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.personalizedContent {
+  background: var(--ifm-background-surface-color);
+  border-left: 4px solid var(--ifm-color-primary);
+  border-radius: 0 8px 8px 0;
+  padding: 1.5rem 2rem;
+  font-size: 1rem;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  color: var(--ifm-font-color-base);
+}
+
+.loginPrompt {
+  font-size: 0.9rem;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.error {
+  color: #e53e3e;
+  font-size: 0.85rem;
+}
