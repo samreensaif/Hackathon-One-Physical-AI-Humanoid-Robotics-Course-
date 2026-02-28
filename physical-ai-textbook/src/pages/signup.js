@@ -77,7 +77,7 @@ export default function Signup() {
     localStorage.setItem('auth_user', JSON.stringify(user));
     localStorage.setItem('auth_session', JSON.stringify({ email: form.email, name: form.name }));
     setDone(true);
-    setTimeout(() => { window.location.href = '/'; }, 1500);
+    setTimeout(() => { window.location.href = '/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/'; }, 1500);
   };
 
   if (done) {

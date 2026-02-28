@@ -16,7 +16,7 @@ export default function AuthButtons({ mobile }) {
 
   const handleSignOut = () => {
     localStorage.removeItem('auth_session');
-    window.location.href = '/';
+    window.location.href = '/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/';
   };
 
   // Avoid SSR mismatch — render nothing until mounted on client

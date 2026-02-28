@@ -27,7 +27,7 @@ export default function Signin() {
     }
     localStorage.setItem('auth_session', JSON.stringify({ email: user.email, name: user.name }));
     setDone(true);
-    setTimeout(() => { window.location.href = '/'; }, 1000);
+    setTimeout(() => { window.location.href = '/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/'; }, 1000);
   };
 
   if (done) {
