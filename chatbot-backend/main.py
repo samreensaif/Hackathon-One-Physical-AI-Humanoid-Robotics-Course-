@@ -10,6 +10,7 @@ GET  /health            Liveness + Qdrant collection check
 """
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -52,11 +53,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS – configured from .env (settings are module-level cached)
-_cfg = get_settings()
+# CORS – read from ALLOWED_ORIGINS env var, fallback to GitHub Pages origin
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "https://samreensaif.github.io").split(",")
+allowed_origins = [o.strip() for o in allowed_origins]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cfg.get_allowed_origins(),
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
