@@ -1,0 +1,69 @@
+.wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.mobileWrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.5rem 0;
+}
+
+.greeting {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--ifm-navbar-link-color);
+  white-space: nowrap;
+}
+
+.signInLink {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--ifm-navbar-link-color);
+  text-decoration: none;
+  padding: 0.35rem 0.7rem;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+
+.signInLink:hover {
+  background: var(--ifm-color-emphasis-200);
+  color: var(--ifm-navbar-link-hover-color);
+  text-decoration: none;
+}
+
+.signUpBtn {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #fff !important;
+  text-decoration: none !important;
+  background: var(--ifm-color-primary);
+  padding: 0.35rem 0.85rem;
+  border-radius: 6px;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+
+.signUpBtn:hover {
+  background: var(--ifm-color-primary-dark);
+  text-decoration: none !important;
+}
+
+.signOutBtn {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--ifm-navbar-link-color);
+  background: transparent;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  padding: 0.3rem 0.75rem;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.signOutBtn:hover {
+  background: var(--ifm-color-emphasis-200);
+  border-color: var(--ifm-color-emphasis-400);
+}
