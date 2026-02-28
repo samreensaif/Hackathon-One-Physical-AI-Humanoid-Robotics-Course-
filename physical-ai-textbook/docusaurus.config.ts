@@ -32,7 +32,7 @@ const config: Config = {
     {
       tagName: 'script',
       attributes: { type: 'text/javascript' },
-      innerHTML: 'window.CHATBOT_API_URL = "http://localhost:8000";',
+      innerHTML: 'window.CHATBOT_API_URL = "https://hackathon-one-physical-ai-humanoid.onrender.com";',
     },
   ],
 
