@@ -33,7 +33,12 @@ class Settings(BaseSettings):
     textbook_docs_path: str = "../physical-ai-textbook/docs"
 
     # CORS – comma-separated list of allowed origins
-    allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    allowed_origins: str = (
+        "https://samreensaif.github.io,"
+        "https://hackathon-one-physical-ai-humanoid.onrender.com,"
+        "http://localhost:3000,"
+        "http://localhost:8000"
+    )
 
     # RAG parameters
     embedding_model: str = "text-embedding-3-small"
