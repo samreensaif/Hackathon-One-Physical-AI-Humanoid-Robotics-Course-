@@ -1,0 +1,324 @@
+---
+title: "Chapter 4: Unity for Robot Visualization"
+sidebar_position: 4
+---
+
+import TranslateButton from '@site/src/components/TranslateButton';
+import PersonalizeButton from '@site/src/components/PersonalizeButton';
+
+<TranslateButton />
+<PersonalizeButton />
+
+# Chapter 4: Unity for Robot Visualization
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Set up the Unity Robotics Hub and configure a ROS-TCP connection
+- Stream real-time sensor and joint data from ROS 2 into Unity
+- Leverage Unity's High Definition Render Pipeline (HDRP) for photorealistic robot scenes
+- Build interactive human-robot interaction (HRI) environments in Unity
+
+---
+
+## 4.1 Why Unity for Robotics?
+
+While Gazebo and NVIDIA Isaac Sim are purpose-built robot simulators, **Unity** brings a different set of strengths to Physical AI development:
+
+| Feature | Gazebo / Isaac Sim | Unity |
+|---|---|---|
+| Physics accuracy | High | Moderate–High |
+| Visual fidelity | Moderate | Very High (HDRP) |
+| Human-in-the-loop scenes | Limited | Excellent |
+| Asset ecosystem | ROS-specific | Millions of assets |
+| Scripting | Python / C++ | C# |
+| VR/AR support | Limited | Native |
+
+Unity excels when you need **photorealistic rendering**, **crowd simulation**, or **VR-based teleoperation** interfaces — all common requirements in human-robot interaction research.
+
+---
+
+## 4.2 Unity Robotics Hub Setup
+
+The **Unity Robotics Hub** is an open-source collection of packages from Unity Technologies that bridges Unity and ROS/ROS 2.
+
+### 4.2.1 Prerequisites
+
+- Unity 2021.3 LTS or later (Unity 6 recommended)
+- ROS 2 Humble or later installed on your machine
+- Python 3.10+
+
+### 4.2.2 Installing the Unity Robotics Hub Package
+
+1. Open your Unity project (or create a new one with **3D (HDRP)** template).
+2. Go to **Window → Package Manager → + → Add package from git URL**.
+3. Enter:
+
+```
+https://github.com/Unity-Technologies/ROS-TCP-Connector.git?path=/com.unity.robotics.ros-tcp-connector
+```
+
+4. Repeat for the URDF Importer:
+
+```
+https://github.com/Unity-Technologies/URDF-Importer.git?path=/com.unity.robotics.urdf-importer
+```
+
+5. Unity will resolve dependencies automatically.
+
+### 4.2.3 Importing a URDF Robot
+
+Once the URDF Importer is installed:
+
+1. Place your `.urdf` file and mesh assets inside `Assets/URDF/`.
+2. In the **Project** panel, right-click the `.urdf` file → **Import Robot from URDF**.
+3. A GameObject hierarchy matching your robot's link/joint tree will be generated.
+
+```
+Robot (root)
+├── base_link
+│   ├── Collision
+│   └── Visual
+├── shoulder_link
+│   ├── Collision
+│   └── Visual
+└── ...
+```
+
+---
+
+## 4.3 ROS-TCP Connector
+
+The **ROS-TCP Connector** creates a bidirectional TCP bridge between a running ROS 2 network and the Unity runtime.
+
+### 4.3.1 Architecture
+
+```
+ROS 2 Node  <──────────────>  ROS TCP Endpoint  <──TCP──>  Unity (ROS-TCP Connector)
+  (Python)                     (Python server)               (C# package)
+```
+
+- **ROS TCP Endpoint** runs as a Python node on the ROS side.
+- **ROS TCP Connector** runs inside the Unity Editor or built application.
+- Messages are serialised using standard ROS message definitions.
+
+### 4.3.2 Installing the ROS TCP Endpoint
+
+In your ROS 2 workspace:
+
+```bash
+cd ~/ros2_ws/src
+git clone https://github.com/Unity-Technologies/ROS-TCP-Endpoint.git
+cd ~/ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+```
+
+### 4.3.3 Running the Endpoint
+
+```bash
+ros2 run ros_tcp_endpoint default_server_endpoint --ros-args \
+  -p ROS_IP:=0.0.0.0 \
+  -p ROS_TCP_PORT:=10000
+```
+
+### 4.3.4 Configuring Unity
+
+In Unity, go to **Robotics → ROS Settings** and set:
+
+- **Protocol**: ROS 2
+- **ROS IP Address**: `127.0.0.1` (or your ROS machine's IP on the network)
+- **ROS Port**: `10000`
+
+### 4.3.5 Publishing and Subscribing in C#
+
+**Subscribe to a topic** (e.g. joint states):
+
+```csharp
+using Unity.Robotics.ROSTCPConnector;
+using RosMessageTypes.Sensor;
+
+public class JointStateSubscriber : MonoBehaviour
+{
+    ROSConnection ros;
+
+    void Start()
+    {
+        ros = ROSConnection.GetOrCreateInstance();
+        ros.Subscribe<JointStateMsg>("/joint_states", OnJointState);
+    }
+
+    void OnJointState(JointStateMsg msg)
+    {
+        for (int i = 0; i < msg.name.Length; i++)
+        {
+            Debug.Log($"{msg.name[i]}: {msg.position[i]:F3} rad");
+        }
+    }
+}
+```
+
+**Publish to a topic** (e.g. velocity commands):
+
+```csharp
+using RosMessageTypes.Geometry;
+
+public class VelocityPublisher : MonoBehaviour
+{
+    ROSConnection ros;
+    const string topicName = "/cmd_vel";
+    const float publishRate = 10f; // Hz
+
+    void Start()
+    {
+        ros = ROSConnection.GetOrCreateInstance();
+        ros.RegisterPublisher<TwistMsg>(topicName);
+        InvokeRepeating(nameof(Publish), 0f, 1f / publishRate);
+    }
+
+    void Publish()
+    {
+        var msg = new TwistMsg();
+        msg.linear.x = 0.5;
+        ros.Publish(topicName, msg);
+    }
+}
+```
+
+---
+
+## 4.4 High-Fidelity Rendering with HDRP
+
+Unity's **High Definition Render Pipeline (HDRP)** produces photorealistic output suitable for generating synthetic training data and compelling demonstrations.
+
+### 4.4.1 Key HDRP Features for Robotics
+
+| Feature | Application |
+|---|---|
+| Ray-traced shadows & reflections | Realistic indoor scenes |
+| Physically-based materials | Accurate surface appearance |
+| Volumetric fog & lighting | Warehouse/factory ambiance |
+| Post-processing stack | Depth of field, lens flare |
+| Adaptive Probe Volumes | Dynamic global illumination |
+
+### 4.4.2 Setting Up an HDRP Robotics Scene
+
+1. **Sky and Lighting**: Use **HDRI Sky** with a factory or lab HDR environment map.
+2. **Robot Materials**: Apply **Lit** shader with metallic/roughness maps exported from your CAD tool.
+3. **Area Lights**: Place rectangular area lights above workstations to simulate industrial lighting.
+4. **Depth of Field**: Attach a **Volume** component with a Depth of Field override to simulate camera optics.
+
+```
+Scene
+├── Sky Volume (HDRI Sky + Exposure)
+├── Directional Light (Sun)
+├── Area Lights (ceiling panels)
+├── Robot Prefab
+│   └── Camera Mount
+│       └── Volume (Depth of Field)
+└── Environment (floor, walls, obstacles)
+```
+
+### 4.4.3 Synthetic Dataset Generation
+
+HDRP scenes can be combined with Unity's **Perception Package** to generate annotated synthetic datasets:
+
+```bash
+# Install via Package Manager
+https://github.com/Unity-Technologies/com.unity.perception.git
+```
+
+The Perception package provides:
+- **Randomizers** — vary object poses, materials, and lighting each frame
+- **Labelers** — generate bounding box, segmentation, and depth ground truth automatically
+- Export in **COCO** or **Pascal VOC** format for training downstream models
+
+---
+
+## 4.5 Human-Robot Interaction Scenes
+
+Unity's strengths in animation, crowd simulation, and VR make it ideal for **HRI research**.
+
+### 4.5.1 Animated Human Characters
+
+Use **Unity's Humanoid Avatar** system with motion-captured animations:
+
+1. Import a humanoid character (e.g. from Mixamo or ReadyPlayerMe).
+2. Set **Rig → Animation Type: Humanoid** in the import settings.
+3. Apply an **Animator Controller** with states for idle, walk, gesture, etc.
+4. Drive state transitions from ROS topic data to synchronise human and robot actions.
+
+### 4.5.2 Proxemic Zones
+
+Model the four proxemic zones for safe HRI:
+
+```
+Intimate  0 – 0.45 m   (robot should halt)
+Personal  0.45 – 1.2 m (slow approach permitted)
+Social    1.2 – 3.6 m  (normal interaction zone)
+Public    > 3.6 m      (free navigation)
+```
+
+In Unity, implement these as nested **Sphere Colliders** on the human prefab with `isTrigger = true`, and publish zone events back to ROS as `std_msgs/String` messages.
+
+### 4.5.3 VR Teleoperation Interface
+
+For immersive robot teleoperation:
+
+1. Install **XR Plugin Management** and enable your headset's XR provider (OpenXR, Oculus, etc.).
+2. Replace the main camera with an **XR Rig** prefab.
+3. Map controller input to ROS velocity commands:
+
+```csharp
+using UnityEngine.XR;
+
+Vector2 joystick = new Vector2();
+InputDevices.GetDeviceAtXRNode(XRNode.LeftHand)
+    .TryGetFeatureValue(CommonUsages.primary2DAxis, out joystick);
+
+var twist = new TwistMsg();
+twist.linear.x  =  joystick.y * maxLinearSpeed;
+twist.angular.z = -joystick.x * maxAngularSpeed;
+ros.Publish("/cmd_vel", twist);
+```
+
+4. Stream the robot's camera feed back into the VR headset using a **Render Texture** displayed on a world-space canvas.
+
+---
+
+## 4.6 Practical Exercise
+
+Build a Unity scene that:
+
+1. Loads a TurtleBot3 URDF using the URDF Importer.
+2. Subscribes to `/joint_states` and visualises wheel rotation in real time.
+3. Publishes `/cmd_vel` from keyboard input (WASD).
+4. Places an HDRP factory environment around the robot.
+5. Adds one animated human character that publishes proxemic zone events to ROS.
+
+Test the pipeline end-to-end by running the ROS TCP Endpoint alongside a `teleop_twist_keyboard` node.
+
+---
+
+## Summary
+
+In this chapter you learned how to:
+
+- Install and configure the **Unity Robotics Hub** and **URDF Importer**
+- Bridge ROS 2 and Unity with the **ROS-TCP Connector** for real-time message exchange
+- Produce photorealistic robot environments using Unity's **HDRP**
+- Generate annotated synthetic datasets with the **Perception Package**
+- Design **HRI scenes** with animated humans, proxemic zones, and VR teleoperation
+
+Unity complements dedicated robot simulators by providing unmatched visual fidelity and interactive human elements, making it a powerful tool in any Physical AI developer's toolkit.
+
+---
+
+## Review Questions
+
+1. What is the role of the ROS TCP Endpoint, and where does it run?
+2. How does the URDF Importer represent a robot's link/joint hierarchy in Unity?
+3. What are three HDRP features that improve synthetic data quality for robot perception?
+4. Describe how proxemic zones can be implemented and communicated back to ROS 2.
+5. What Unity package would you use to automatically generate bounding-box annotations for a synthetic dataset?

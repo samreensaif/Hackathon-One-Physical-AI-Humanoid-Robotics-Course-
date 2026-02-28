@@ -31,6 +31,7 @@ const sidebars: SidebarsConfig = {
         'module2-simulation/chapter1',
         'module2-simulation/chapter2',
         'module2-simulation/chapter3',
+        'module2-simulation/chapter4',
       ],
     },
     {
