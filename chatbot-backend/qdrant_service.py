@@ -161,9 +161,9 @@ async def semantic_search(
 
     return [
         {
-            "text": r.payload["text"],
-            "source": r.payload["source"],
-            "title": r.payload.get("title", ""),
+            "text": r.payload.get("text", ""),
+            "source": r.payload.get("source_file", "unknown"),
+            "title": r.payload.get("module_name", "unknown"),
             "chunk_index": r.payload.get("chunk_index", 0),
             "score": round(r.score, 4),
         }
