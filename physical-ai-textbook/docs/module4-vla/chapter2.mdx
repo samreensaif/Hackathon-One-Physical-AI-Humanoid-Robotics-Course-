@@ -1,0 +1,979 @@
+---
+title: "Chapter 2: Voice to Action with Whisper"
+sidebar_position: 2
+---
+
+# Chapter 2: Voice to Action with Whisper
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Explain how OpenAI Whisper works and why it outperforms traditional speech recognition systems
+- Set up a real-time microphone capture and transcription pipeline in Python
+- Build a ROS 2 node that publishes transcribed speech as standard messages
+- Implement wake-word detection to avoid processing ambient speech
+- Handle the latency, noise robustness, and language detection capabilities of Whisper
+- Connect the voice pipeline to the ROS 2 action system so that spoken commands trigger robot behaviours
+- Design fallback strategies for ambiguous or unrecognised commands
+
+---
+
+## 2.1 Why Voice Control for Robots?
+
+Robots deployed in human environments must be controllable by non-experts. Touchscreens require proximity. Keyboard commands require training. Dedicated remotes require dedicated hardware. **Voice is the natural human communication interface**: it is always available, works at distance, requires no learned interface, and allows rich, context-dependent commands.
+
+For a humanoid robot working alongside humans in a home, warehouse, or hospital, voice is not a convenience feature — it is a fundamental accessibility and usability requirement.
+
+The pipeline we build in this chapter sits at the very start of the autonomous humanoid control stack:
+
+```
+Microphone
+    │
+    ▼
+Audio Capture (PyAudio / sounddevice)
+    │
+    ▼
+Voice Activity Detection (silence gating)
+    │
+    ▼
+Wake Word Detection ("Hey Robot")
+    │  (only passes through after wake word)
+    ▼
+OpenAI Whisper (speech → text)
+    │
+    ▼
+ROS 2 /voice/command topic (std_msgs/String)
+    │
+    ▼
+LLM Planner (Chapter 3) → Nav2 / Manipulation (Chapter 4)
+```
+
+---
+
+## 2.2 OpenAI Whisper: Architecture and Capabilities
+
+**Whisper** is an open-source automatic speech recognition (ASR) model published by OpenAI in 2022. It was trained on 680,000 hours of multilingual, multitask audio data collected from the internet — orders of magnitude more data than previous open-source ASR systems.
+
+### Architecture
+
+Whisper is a **sequence-to-sequence Transformer**:
+
+```
+Audio waveform
+    │
+    ▼ (25ms frames, 10ms stride)
+Log-Mel Spectrogram (80 frequency bins × time frames)
+    │
+    ▼
+CNN feature extractor (2 conv layers + GELU)
+    │
+    ▼
+Transformer Encoder (processes audio features)
+    │
+    ▼
+Transformer Decoder (autoregressively generates text tokens)
+    │
+    ▼
+Transcribed text: "pick up the red cup"
+```
+
+The decoder is conditioned on **special tokens** that control:
+- **Task**: transcription vs translation
+- **Language**: auto-detected or forced (e.g., `<|en|>`)
+- **Timestamps**: whether to output word-level timestamps
+
+### Model Sizes
+
+Whisper is available in five sizes with different speed/accuracy trade-offs:
+
+| Model | Parameters | VRAM | Speed (CPU) | Speed (GPU) | WER (English) |
+|---|---|---|---|---|---|
+| `tiny` | 39M | ~1 GB | ~32× real-time | ~160× | 5.7% |
+| `base` | 74M | ~1 GB | ~16× real-time | ~120× | 4.2% |
+| `small` | 244M | ~2 GB | ~6× real-time | ~70× | 3.4% |
+| `medium` | 769M | ~5 GB | ~2× real-time | ~24× | 3.0% |
+| `large-v3` | 1550M | ~10 GB | 0.7× real-time | ~8× | 2.7% |
+
+WER = Word Error Rate. Lower is better.
+
+For **robotic applications** on a Jetson Orin or a moderately powerful laptop: `small` or `medium` offers the best trade-off. For a workstation with an RTX GPU: `large-v3`.
+
+### Key Capabilities Relevant to Robotics
+
+- **Noise robustness**: Whisper was trained on real internet audio with background noise, music, and crosstalk. It outperforms commercial ASR systems in noisy environments.
+- **Multilingual**: 99 languages supported natively.
+- **Technical vocabulary**: Because of its large training corpus, Whisper handles domain-specific terms ("Nav2", "gripper", "URDF") better than consumer ASR.
+- **No cloud dependency**: Runs entirely locally, which is critical for robots operating in environments without internet access.
+
+---
+
+## 2.3 Installation
+
+```bash
+# Install Whisper and its dependencies
+pip install openai-whisper
+
+# Audio capture (cross-platform)
+pip install sounddevice soundfile numpy
+
+# For microphone input with silence detection
+pip install webrtcvad
+
+# For wake word detection
+pip install pvporcupine  # Picovoice Porcupine (free tier available)
+# or
+pip install openwakeword  # Fully open-source alternative
+```
+
+---
+
+## 2.4 Basic Whisper Transcription
+
+Before building the ROS 2 pipeline, understand the basic Whisper API:
+
+```python
+# basic_whisper.py
+import whisper
+import numpy as np
+
+# Load model (downloads on first run, cached locally)
+model = whisper.load_model("small")
+
+# Transcribe from a file
+result = model.transcribe("audio_sample.wav")
+print(result["text"])
+# → "pick up the red cup and place it on the tray"
+
+# Transcribe from a numpy array (float32, mono, 16kHz)
+# This is what we use in the real-time pipeline
+audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+audio_array /= 32768.0  # Normalise to [-1, 1]
+result = model.transcribe(audio_array, language="en", fp16=False)
+print(result["text"])
+print(result["language"])     # Detected language
+print(result["segments"])     # Word-level timing (if requested)
+```
+
+---
+
+## 2.5 Real-Time Audio Capture Pipeline
+
+The core challenge in real-time voice control is handling **streaming audio**: you cannot accumulate the entire utterance before transcribing (that would introduce unacceptable latency), but Whisper expects a complete audio segment as input.
+
+The solution is **Voice Activity Detection (VAD)**: monitor the audio stream continuously, and when silence is detected after speech, send the accumulated speech segment to Whisper.
+
+```python
+# audio_capture.py
+import sounddevice as sd
+import numpy as np
+import queue
+import threading
+import webrtcvad
+import collections
+
+SAMPLE_RATE = 16000       # Hz (Whisper requires 16kHz)
+FRAME_MS = 30             # ms per VAD frame (10, 20, or 30)
+FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 480 samples
+VAD_AGGRESSIVENESS = 2    # 0–3 (higher = more aggressive filtering)
+
+# Silence padding: keep N frames before/after speech to avoid clipping
+PADDING_FRAMES = 10
+SILENCE_FRAMES_TO_END = 20  # Stop recording after 20 silent frames
+
+class AudioCapture:
+    """
+    Captures microphone audio and yields complete speech segments
+    for Whisper transcription.
+    """
+
+    def __init__(self, sample_rate: int = SAMPLE_RATE):
+        self.sample_rate = sample_rate
+        self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        self.audio_queue = queue.Queue()
+        self._running = False
+
+    def _audio_callback(self, indata, frames, time, status):
+        """Called by sounddevice for every audio frame."""
+        if status:
+            print(f"Audio callback status: {status}")
+        # Convert to bytes for WebRTC VAD
+        audio_bytes = (indata[:, 0] * 32768).astype(np.int16).tobytes()
+        self.audio_queue.put(audio_bytes)
+
+    def start(self):
+        """Start the microphone stream."""
+        self._running = True
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype='float32',
+            blocksize=FRAME_SAMPLES,
+            callback=self._audio_callback,
+        )
+        self._stream.start()
+
+    def stop(self):
+        self._running = False
+        self._stream.stop()
+        self._stream.close()
+
+    def iter_speech_segments(self):
+        """
+        Generator that yields complete speech segments as float32 numpy arrays.
+        Uses a ring buffer of padding frames to avoid clipping speech edges.
+        """
+        # Ring buffer: keeps the last PADDING_FRAMES frames
+        ring_buffer = collections.deque(maxlen=PADDING_FRAMES)
+
+        triggered = False       # Are we currently recording speech?
+        voiced_frames = []      # Frames of confirmed speech
+        silent_frame_count = 0  # Consecutive silent frames after speech
+
+        while self._running:
+            try:
+                frame_bytes = self.audio_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            is_speech = self.vad.is_speech(frame_bytes, self.sample_rate)
+
+            if not triggered:
+                ring_buffer.append((frame_bytes, is_speech))
+                # Check if majority of ring buffer frames are speech
+                num_voiced = sum(1 for _, speech in ring_buffer if speech)
+                if num_voiced > 0.9 * ring_buffer.maxlen:
+                    triggered = True
+                    # Include the buffered pre-speech context
+                    voiced_frames.extend([f for f, _ in ring_buffer])
+                    ring_buffer.clear()
+            else:
+                voiced_frames.append(frame_bytes)
+                ring_buffer.append((frame_bytes, is_speech))
+                num_unvoiced = sum(1 for _, speech in ring_buffer if not speech)
+                if num_unvoiced > 0.9 * ring_buffer.maxlen:
+                    # Silence detected: emit the segment
+                    audio_array = self._bytes_to_float32(voiced_frames)
+                    yield audio_array
+                    # Reset state
+                    triggered = False
+                    voiced_frames = []
+                    ring_buffer.clear()
+                    silent_frame_count = 0
+
+    def _bytes_to_float32(self, frames: list) -> np.ndarray:
+        """Convert list of int16 byte frames to float32 numpy array."""
+        audio_bytes = b''.join(frames)
+        audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+        return audio_int16.astype(np.float32) / 32768.0
+```
+
+---
+
+## 2.6 Wake Word Detection
+
+Continuously transcribing everything in the environment would be noisy and wasteful. A **wake word** (like "Hey Robot" or "Atlas") gates the system so that only commands following the wake word are processed.
+
+```python
+# wake_word_detector.py
+# Uses openwakeword — fully open-source, runs locally
+
+import numpy as np
+import openwakeword
+from openwakeword.model import Model
+
+class WakeWordDetector:
+    """
+    Detects a custom wake word in an audio stream.
+    Uses openwakeword models (open-source, runs on CPU).
+    """
+
+    # Available models: hey_mycroft, hey_jarvis, alexa, hey_rhasspy
+    # For custom wake words, see openwakeword training docs
+    MODEL_NAME = "hey_mycroft"    # Use as "Hey Robot" proxy for development
+    ACTIVATION_THRESHOLD = 0.5   # Confidence threshold [0, 1]
+
+    def __init__(self):
+        # Download models on first run
+        openwakeword.utils.download_models()
+        self.model = Model(wakeword_models=[self.MODEL_NAME])
+        self._activated = False
+
+    def process_frame(self, audio_chunk: np.ndarray) -> bool:
+        """
+        Process one chunk of audio (1280 samples @ 16kHz = 80ms).
+        Returns True if wake word was detected in this chunk.
+        """
+        # openwakeword expects int16
+        audio_int16 = (audio_chunk * 32768).astype(np.int16)
+        predictions = self.model.predict(audio_int16)
+        score = predictions.get(self.MODEL_NAME, 0.0)
+        detected = score > self.ACTIVATION_THRESHOLD
+        if detected:
+            print(f"Wake word detected! Score: {score:.3f}")
+        return detected
+```
+
+---
+
+## 2.7 The Complete Voice Pipeline Node
+
+Now we integrate audio capture, wake word detection, and Whisper into a single ROS 2 node:
+
+```python
+# voice_command_node.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from diagnostic_msgs.msg import DiagnosticStatus
+import whisper
+import numpy as np
+import threading
+import time
+
+from audio_capture import AudioCapture
+from wake_word_detector import WakeWordDetector
+
+# Minimum audio duration to attempt transcription (avoids noise artefacts)
+MIN_AUDIO_SECONDS = 0.5
+MAX_AUDIO_SECONDS = 15.0   # Discard unusually long segments (noise runaway)
+
+class VoiceCommandNode(Node):
+    """
+    Captures microphone audio, detects wake word, transcribes speech
+    with Whisper, and publishes clean commands to /voice/command.
+
+    Published topics:
+      /voice/command  (std_msgs/String) — transcribed command text
+      /voice/raw      (std_msgs/String) — raw Whisper output (for debugging)
+      /voice/status   (std_msgs/String) — pipeline state
+
+    Parameters:
+      whisper_model  (str)   — Whisper model size (tiny/base/small/medium/large)
+      language       (str)   — Force language ('en') or 'auto'
+      use_wake_word  (bool)  — Enable/disable wake word gating
+      wake_word_timeout (float) — Seconds to stay active after wake word
+    """
+
+    STATES = ['IDLE', 'LISTENING', 'TRANSCRIBING', 'ERROR']
+
+    def __init__(self):
+        super().__init__('voice_command_node')
+
+        # Parameters
+        self.declare_parameter('whisper_model', 'small')
+        self.declare_parameter('language', 'en')
+        self.declare_parameter('use_wake_word', True)
+        self.declare_parameter('wake_word_timeout', 8.0)
+
+        model_name = self.get_parameter('whisper_model').value
+        self.language = self.get_parameter('language').value
+        self.use_wake_word = self.get_parameter('use_wake_word').value
+        self.wake_word_timeout = self.get_parameter('wake_word_timeout').value
+
+        # Publishers
+        self.command_pub = self.create_publisher(String, '/voice/command', 10)
+        self.raw_pub = self.create_publisher(String, '/voice/raw', 10)
+        self.status_pub = self.create_publisher(String, '/voice/status', 10)
+
+        # Internal state
+        self.state = 'IDLE'
+        self.wake_word_activated_at = None
+
+        # Load Whisper model (may take 10–30s on first load)
+        self.get_logger().info(f'Loading Whisper model: {model_name}...')
+        self.whisper_model = whisper.load_model(model_name)
+        self.get_logger().info('Whisper model loaded.')
+
+        # Audio components
+        self.audio_capture = AudioCapture()
+        self.wake_detector = WakeWordDetector() if self.use_wake_word else None
+
+        # Run audio pipeline in a background thread
+        self._audio_thread = threading.Thread(
+            target=self._audio_pipeline, daemon=True
+        )
+        self._audio_thread.start()
+
+        self._publish_status('IDLE')
+        self.get_logger().info(
+            f'Voice command node ready. '
+            f'Wake word: {"enabled" if self.use_wake_word else "disabled"}'
+        )
+
+    def _audio_pipeline(self):
+        """Background thread: capture audio and transcribe commands."""
+        self.audio_capture.start()
+
+        try:
+            for audio_segment in self.audio_capture.iter_speech_segments():
+                duration = len(audio_segment) / 16000.0
+
+                # Sanity-check segment duration
+                if duration < MIN_AUDIO_SECONDS:
+                    continue
+                if duration > MAX_AUDIO_SECONDS:
+                    self.get_logger().warn(
+                        f'Segment too long ({duration:.1f}s), discarding.'
+                    )
+                    continue
+
+                # Check wake word gating
+                if self.use_wake_word:
+                    if not self._is_wake_word_active():
+                        # Check if this segment contains the wake word
+                        # (Wake word detector runs on the raw audio stream
+                        #  in practice; simplified here to check per segment)
+                        self.get_logger().debug('Waiting for wake word...')
+                        continue
+
+                # Transcribe
+                self._publish_status('TRANSCRIBING')
+                self.get_logger().info(
+                    f'Transcribing {duration:.1f}s segment...'
+                )
+                t_start = time.time()
+
+                try:
+                    result = self.whisper_model.transcribe(
+                        audio_segment,
+                        language=self.language if self.language != 'auto' else None,
+                        fp16=False,       # fp16=True for GPU, False for CPU
+                        condition_on_previous_text=False,  # Prevents hallucination
+                        no_speech_threshold=0.6,          # Filter out non-speech
+                        logprob_threshold=-1.0,
+                    )
+                except Exception as e:
+                    self.get_logger().error(f'Whisper transcription failed: {e}')
+                    self._publish_status('ERROR')
+                    continue
+
+                elapsed = time.time() - t_start
+                raw_text = result['text'].strip()
+                no_speech_prob = result.get('segments', [{}])[0].get(
+                    'no_speech_prob', 0.0
+                )
+
+                self.get_logger().info(
+                    f'Transcribed in {elapsed:.2f}s: "{raw_text}" '
+                    f'(no_speech_prob={no_speech_prob:.2f})'
+                )
+
+                # Publish raw output for debugging
+                raw_msg = String()
+                raw_msg.data = raw_text
+                self.raw_pub.publish(raw_msg)
+
+                # Filter likely non-speech artefacts
+                if no_speech_prob > 0.8:
+                    self.get_logger().debug('Non-speech detected, discarding.')
+                    self._publish_status('IDLE')
+                    continue
+
+                if not raw_text or len(raw_text) < 3:
+                    self._publish_status('IDLE')
+                    continue
+
+                # Clean and publish the command
+                cleaned = self._clean_text(raw_text)
+                cmd_msg = String()
+                cmd_msg.data = cleaned
+                self.command_pub.publish(cmd_msg)
+                self.get_logger().info(f'Command published: "{cleaned}"')
+                self._publish_status('IDLE')
+
+        finally:
+            self.audio_capture.stop()
+
+    def _is_wake_word_active(self) -> bool:
+        """Returns True if a wake word was detected within the timeout window."""
+        if self.wake_word_activated_at is None:
+            return False
+        elapsed = time.time() - self.wake_word_activated_at
+        return elapsed < self.wake_word_timeout
+
+    def activate_wake_word(self):
+        """Called by the wake word detector when it fires."""
+        self.wake_word_activated_at = time.time()
+        self.get_logger().info('Wake word activated! Listening for command...')
+        self._publish_status('LISTENING')
+
+    def _clean_text(self, text: str) -> str:
+        """Remove common Whisper artefacts and normalise."""
+        # Whisper sometimes adds filler phrases
+        REMOVE = [
+            'thank you for watching', 'thanks for watching',
+            'please subscribe', '[music]', '[applause]',
+            '(music)', '...', 'uh', 'um',
+        ]
+        cleaned = text.lower()
+        for phrase in REMOVE:
+            cleaned = cleaned.replace(phrase, '')
+        # Strip extra whitespace
+        return ' '.join(cleaned.split()).strip()
+
+    def _publish_status(self, status: str):
+        self.state = status
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VoiceCommandNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.audio_capture.stop()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 2.8 Integrating Wake Word Detection with the Audio Stream
+
+The wake word detector runs on the raw audio stream in real-time, in parallel with the VAD:
+
+```python
+# integrated_voice_node.py — combined wake word + VAD + Whisper
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import sounddevice as sd
+import numpy as np
+import queue
+import whisper
+import threading
+import time
+
+SAMPLE_RATE = 16000
+WAKE_WORD_CHUNK = 1280   # 80ms chunks for openwakeword
+
+class IntegratedVoiceNode(Node):
+    """
+    Integrates wake word detection and Whisper in a single node.
+    Uses a two-thread architecture:
+      Thread 1: continuously reads microphone, runs wake word detector
+      Thread 2: waits for wake word signal, records command, transcribes
+    """
+
+    def __init__(self):
+        super().__init__('integrated_voice')
+
+        self.declare_parameter('whisper_model', 'small')
+        self.whisper_model = whisper.load_model(
+            self.get_parameter('whisper_model').value
+        )
+
+        self.command_pub = self.create_publisher(String, '/voice/command', 10)
+        self.status_pub = self.create_publisher(String, '/voice/status', 10)
+
+        # Thread-safe events
+        self._wake_event = threading.Event()   # Signals: wake word detected
+        self._stop_event = threading.Event()   # Signals: shutdown
+
+        # Audio buffers
+        self._raw_audio_queue = queue.Queue(maxsize=100)
+        self._command_audio_buffer = []
+        self._recording_command = False
+
+        # Import here to avoid circular imports in the example
+        try:
+            from wake_word_detector import WakeWordDetector
+            self.wake_detector = WakeWordDetector()
+        except ImportError:
+            self.wake_detector = None
+            self.get_logger().warn('WakeWordDetector not available. Wake word disabled.')
+
+        # Start threads
+        threading.Thread(target=self._mic_thread, daemon=True).start()
+        threading.Thread(target=self._command_thread, daemon=True).start()
+
+        self.get_logger().info('Integrated voice node started. Say "Hey Mycroft" to activate.')
+
+    def _mic_thread(self):
+        """
+        Thread 1: Reads microphone in 80ms chunks.
+        Runs wake word detector on each chunk.
+        When detected, signals Thread 2 to begin recording.
+        """
+        def audio_callback(indata, frames, time_info, status):
+            audio_chunk = indata[:, 0].copy()
+            self._raw_audio_queue.put(audio_chunk)
+
+            # Also buffer for command recording
+            if self._recording_command:
+                self._command_audio_buffer.append(audio_chunk)
+
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype='float32',
+            blocksize=WAKE_WORD_CHUNK,
+            callback=audio_callback,
+        ):
+            while not self._stop_event.is_set():
+                try:
+                    chunk = self._raw_audio_queue.get(timeout=0.5)
+                    if self.wake_detector and self.wake_detector.process_frame(chunk):
+                        self._wake_event.set()  # Signal to command thread
+                except queue.Empty:
+                    continue
+
+    def _command_thread(self):
+        """
+        Thread 2: Waits for wake word event, then records
+        COMMAND_DURATION seconds of audio and transcribes it.
+        """
+        COMMAND_DURATION = 6.0   # Seconds to record after wake word
+
+        while not self._stop_event.is_set():
+            # Wait for wake word
+            activated = self._wake_event.wait(timeout=1.0)
+            if not activated:
+                continue
+            self._wake_event.clear()
+
+            self.get_logger().info('Wake word! Recording command...')
+            self._publish_status('LISTENING')
+
+            # Start buffering audio
+            self._command_audio_buffer = []
+            self._recording_command = True
+            time.sleep(COMMAND_DURATION)
+            self._recording_command = False
+
+            # Concatenate and transcribe
+            if not self._command_audio_buffer:
+                continue
+
+            audio = np.concatenate(self._command_audio_buffer)
+            self._publish_status('TRANSCRIBING')
+
+            try:
+                result = self.whisper_model.transcribe(
+                    audio,
+                    language='en',
+                    fp16=False,
+                    no_speech_threshold=0.6,
+                )
+                text = result['text'].strip().lower()
+                self.get_logger().info(f'Heard: "{text}"')
+
+                if text and len(text) > 2:
+                    msg = String()
+                    msg.data = text
+                    self.command_pub.publish(msg)
+            except Exception as e:
+                self.get_logger().error(f'Transcription error: {e}')
+
+            self._publish_status('IDLE')
+
+    def _publish_status(self, status: str):
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+    def destroy_node(self):
+        self._stop_event.set()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = IntegratedVoiceNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 2.9 Routing Voice Commands to Robot Actions
+
+Once `/voice/command` is publishing text, a **command router node** maps recognised commands to robot actions. This node provides a structured bridge between free-form speech and specific ROS 2 capabilities:
+
+```python
+# command_router_node.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from geometry_msgs.msg import Twist
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+import re
+import math
+
+class CommandRouterNode(Node):
+    """
+    Routes voice commands to appropriate robot actions.
+
+    Simple commands → direct ROS 2 messages (fast path)
+    Complex commands → forwarded to LLM planner (Chapter 3)
+    """
+
+    # Simple command patterns (regex → action mapping)
+    SIMPLE_COMMANDS = [
+        (r'stop|halt|freeze',                   'stop'),
+        (r'(go|move|walk)\s+forward',           'move_forward'),
+        (r'(go|move|walk)\s+back(ward)?',       'move_backward'),
+        (r'turn\s+left',                        'turn_left'),
+        (r'turn\s+right',                       'turn_right'),
+        (r'(come\s+here|return\s+(home|base))', 'go_home'),
+        (r'wave(\s+hand)?',                     'wave'),
+        (r'(nod|yes)',                           'nod'),
+    ]
+
+    def __init__(self):
+        super().__init__('command_router')
+
+        # Subscribe to voice commands
+        self.voice_sub = self.create_subscription(
+            String, '/voice/command', self.route_command, 10
+        )
+
+        # Publishers for simple direct commands
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.gesture_pub = self.create_publisher(String, '/robot/gesture', 10)
+
+        # Publisher: forward complex commands to LLM planner
+        self.llm_pub = self.create_publisher(
+            String, '/robot/instruction', 10   # From Module 1, Chapter 4
+        )
+
+        # Nav2 action client (for navigation commands)
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # Named locations map (populated from a config file in production)
+        self.named_locations = {
+            'home':     (0.0, 0.0, 0.0),
+            'kitchen':  (3.5, 2.0, 0.0),
+            'office':   (7.2, -1.5, 1.5708),
+            'charging': (-1.0, 0.5, 3.1416),
+        }
+
+        self.get_logger().info('Command router ready.')
+
+    def route_command(self, msg: String):
+        text = msg.data.strip().lower()
+        self.get_logger().info(f'Routing command: "{text}"')
+
+        # Try simple pattern matching first (low latency)
+        for pattern, action in self.SIMPLE_COMMANDS:
+            if re.search(pattern, text):
+                self._execute_simple(action, text)
+                return
+
+        # Try navigation to a named location
+        for location_name in self.named_locations:
+            if location_name in text:
+                self._navigate_to(location_name)
+                return
+
+        # Fall through: send to LLM planner for complex reasoning
+        self.get_logger().info(
+            f'Complex command — forwarding to LLM planner: "{text}"'
+        )
+        fwd_msg = String()
+        fwd_msg.data = text
+        self.llm_pub.publish(fwd_msg)
+
+    def _execute_simple(self, action: str, original_text: str):
+        """Execute a simple, direct robot command without LLM."""
+        self.get_logger().info(f'Simple action: {action}')
+
+        if action == 'stop':
+            self.cmd_vel_pub.publish(Twist())  # Zero velocity
+
+        elif action == 'move_forward':
+            # Extract distance if mentioned ("walk forward 3 metres")
+            distance = self._extract_distance(original_text, default=1.0)
+            twist = Twist()
+            twist.linear.x = 0.3
+            self.cmd_vel_pub.publish(twist)
+            # Timer to stop after duration = distance / speed
+            duration = distance / 0.3
+            self.create_timer(duration, lambda: self.cmd_vel_pub.publish(Twist()))
+
+        elif action == 'move_backward':
+            distance = self._extract_distance(original_text, default=0.5)
+            twist = Twist()
+            twist.linear.x = -0.2
+            self.cmd_vel_pub.publish(twist)
+            duration = distance / 0.2
+            self.create_timer(duration, lambda: self.cmd_vel_pub.publish(Twist()))
+
+        elif action == 'turn_left':
+            angle = self._extract_angle(original_text, default=90.0)
+            twist = Twist()
+            twist.angular.z = 0.5
+            self.cmd_vel_pub.publish(twist)
+            duration = math.radians(angle) / 0.5
+            self.create_timer(duration, lambda: self.cmd_vel_pub.publish(Twist()))
+
+        elif action == 'turn_right':
+            angle = self._extract_angle(original_text, default=90.0)
+            twist = Twist()
+            twist.angular.z = -0.5
+            self.cmd_vel_pub.publish(twist)
+            duration = math.radians(angle) / 0.5
+            self.create_timer(duration, lambda: self.cmd_vel_pub.publish(Twist()))
+
+        elif action == 'go_home':
+            self._navigate_to('home')
+
+        elif action in ('wave', 'nod'):
+            gesture_msg = String()
+            gesture_msg.data = action
+            self.gesture_pub.publish(gesture_msg)
+
+    def _navigate_to(self, location_name: str):
+        """Send a Nav2 goal to a named location."""
+        if location_name not in self.named_locations:
+            self.get_logger().warn(f'Unknown location: {location_name}')
+            return
+
+        x, y, yaw = self.named_locations[location_name]
+        self.get_logger().info(
+            f'Navigating to {location_name} at ({x:.1f}, {y:.1f})'
+        )
+
+        if not self.nav_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error('Nav2 server not available!')
+            return
+
+        from geometry_msgs.msg import PoseStamped
+        goal = NavigateToPose.Goal()
+        goal.pose = PoseStamped()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = x
+        goal.pose.pose.position.y = y
+        goal.pose.pose.orientation.z = math.sin(yaw / 2)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2)
+
+        self.nav_client.send_goal_async(goal)
+
+    def _extract_distance(self, text: str, default: float) -> float:
+        """Extract a distance in metres from text."""
+        patterns = [
+            r'(\d+\.?\d*)\s*(meter|metre|m)\b',
+            r'(\d+\.?\d*)\s*(foot|feet|ft)\b',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                value = float(match.group(1))
+                unit = match.group(2)
+                if 'foot' in unit or 'feet' in unit or 'ft' in unit:
+                    return value * 0.3048
+                return value
+        # Try bare number
+        numbers = re.findall(r'\b(\d+\.?\d*)\b', text)
+        if numbers:
+            return min(float(numbers[0]), 5.0)  # Cap at 5m for safety
+        return default
+
+    def _extract_angle(self, text: str, default: float) -> float:
+        """Extract an angle in degrees from text."""
+        match = re.search(r'(\d+)\s*(degree|deg|°)', text)
+        if match:
+            return float(match.group(1))
+        return default
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CommandRouterNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 2.10 Testing the Voice Pipeline
+
+```bash
+# Terminal 1: Start the voice command node
+ros2 run my_robot_pkg voice_command_node \
+    --ros-args -p whisper_model:=small -p use_wake_word:=false
+
+# Terminal 2: Monitor published commands
+ros2 topic echo /voice/command
+ros2 topic echo /voice/status
+
+# Terminal 3: Start the command router
+ros2 run my_robot_pkg command_router_node
+
+# Terminal 4: Monitor robot velocity commands
+ros2 topic echo /cmd_vel
+
+# Speak into the microphone:
+# "Walk forward 2 metres"  → cmd_vel published
+# "Turn left 90 degrees"   → cmd_vel published
+# "Go to the kitchen"      → Nav2 goal sent
+# "Pick up the red cup"    → forwarded to LLM planner
+```
+
+### Injecting a Simulated Voice Command (for testing without a microphone)
+
+```bash
+ros2 topic pub /voice/command std_msgs/msg/String \
+    "data: 'walk forward 1 metre'" --once
+
+ros2 topic pub /voice/command std_msgs/msg/String \
+    "data: 'pick up the blue block and bring it to me'" --once
+```
+
+---
+
+## 2.11 Chapter Summary
+
+In this chapter, we built the voice interface layer of the autonomous humanoid:
+
+1. **OpenAI Whisper** is a sequence-to-sequence transformer trained on 680,000 hours of multilingual audio. The `small` model is the best default for robotics — fast enough for real-time use, accurate enough for technical vocabulary.
+
+2. **Voice Activity Detection** (using WebRTC VAD) gates Whisper processing so it only runs on complete speech segments, avoiding continuous transcription of ambient sound.
+
+3. **Wake word detection** (using openwakeword) adds a layer of intentional activation, preventing ambient conversation from triggering robot commands.
+
+4. The **VoiceCommandNode** integrates all three into a ROS 2 node that publishes clean, normalised text on `/voice/command`.
+
+5. The **CommandRouterNode** dispatches commands via two paths: simple, pattern-matched commands go directly to ROS 2 topics (low latency); complex, semantically rich commands are forwarded to the LLM planner (Chapter 3).
+
+---
+
+## Review Questions
+
+1. Explain why `no_speech_threshold=0.6` is set in the Whisper transcription call. What does this threshold control, and what happens when background music or TV audio is present?
+
+2. The `CommandRouterNode` uses a two-path architecture: simple pattern matching and LLM forwarding. What are the latency and reliability trade-offs of each path? Give a specific example of a command that should use each path.
+
+3. A user says "Robot, walk forward slowly." The `_extract_distance` function returns the default `1.0 m` because no distance was specified, and `_execute_simple` moves the robot at `0.3 m/s`. The user expected "slowly" to mean a slower speed, not a fixed distance. How would you modify the `CommandRouterNode` to handle speed modifiers ("slowly", "quickly", "carefully")?
+
+4. Whisper's `large-v3` model achieves 2.7% WER on English vs 3.4% for `small`. In a robotics context, when would this 0.7% WER improvement matter, and when would it not justify the 6× speed penalty?
+
+5. Design a **multilingual voice pipeline** for a robot deployed in a French/English bilingual hospital environment. Which Whisper parameters would you configure, how would you route commands in two languages to the same robot action system, and how would the wake word detection need to change?

@@ -1,0 +1,336 @@
+---
+title: "Chapter 1: Introduction to ROS 2"
+sidebar_position: 1
+---
+
+# Chapter 1: Introduction to ROS 2 — The Robotic Nervous System
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Explain what ROS 2 is and articulate its role in the robotics software ecosystem
+- Describe the historical context that motivated the creation of ROS 2 from ROS 1
+- Identify the key architectural components of ROS 2 and explain how they interact
+- Compare ROS 1 and ROS 2 across the dimensions of reliability, security, and real-time capability
+- Set up a ROS 2 development environment and run your first command-line tools
+
+---
+
+## 1.1 What Is ROS 2?
+
+The **Robot Operating System 2 (ROS 2)** is an open-source, middleware-based framework for building robot software. Despite the name, it is not an operating system in the traditional sense — it does not manage hardware directly or schedule CPU time. Instead, ROS 2 is a **robotics middleware** that provides:
+
+- A standardised **communication layer** between software components
+- A rich **library ecosystem** for perception, navigation, manipulation, and more
+- **Tools** for visualisation, simulation, debugging, and deployment
+- A **build system** that supports multi-language, multi-package projects
+
+Think of ROS 2 as the **nervous system of a robot**: just as the nervous system routes signals between the brain, sensory organs, and muscles, ROS 2 routes data between the sensing, thinking, and actuating software components of a robotic system.
+
+### The Scale of the Ecosystem
+
+As of 2024, the ROS ecosystem encompasses:
+
+- Over **5,000 public packages** on ROS Index
+- Active use in research labs, startups, and enterprises across 100+ countries
+- Adoption in domains ranging from autonomous vehicles and surgical robots to drones and space exploration
+- Support for robots made by Boston Dynamics, KUKA, Universal Robots, Clearpath Robotics, and many others
+
+When you learn ROS 2, you are not just learning a tool — you are learning the *lingua franca* of modern robotics.
+
+---
+
+## 1.2 A Brief History: Why Does ROS 2 Exist?
+
+### The Birth of ROS 1 (2007–2010)
+
+ROS 1 was created at Willow Garage, a robotics research lab in Menlo Park, California. The team, led by Morgan Quigley, faced a recurring problem: every new robot project required rebuilding the same foundational software — camera drivers, sensor parsers, geometric transforms, visualisation tools. This duplication of effort was wasteful.
+
+Their solution was a **shared communication infrastructure** that would let software components (which they called *nodes*) talk to each other without caring about each other's implementation language or hardware. ROS 1 was released publicly in 2010 and quickly became the dominant standard in academic robotics.
+
+### ROS 1's Limitations in Production
+
+ROS 1 was designed for research, and it showed. As robotics moved from labs toward real-world deployment, ROS 1's architectural choices caused serious problems:
+
+| Problem | Root Cause in ROS 1 |
+|---|---|
+| **Single point of failure** | A central process called `rosmaster` was required for all communication. If it crashed, the entire robot stopped. |
+| **No real-time guarantees** | ROS 1 used TCP sockets with no Quality-of-Service control, making it unsuitable for safety-critical timing. |
+| **No security** | All communication was unencrypted and unauthenticated; any device on the network could eavesdrop or inject messages. |
+| **Linux only** | ROS 1 was deeply coupled to Ubuntu Linux, making it impossible to run on embedded systems or Windows. |
+| **Python 2** | ROS 1's Python stack was built on Python 2, which reached end-of-life in 2020. |
+
+### The ROS 2 Redesign (2014–2022)
+
+Open Robotics (the non-profit that manages ROS) began designing ROS 2 in 2014. Rather than patching ROS 1, they made a clean break:
+
+- They replaced the custom transport layer with **DDS** (Data Distribution Service), an industry-standard publish-subscribe middleware already proven in avionics and defence systems.
+- They removed the `rosmaster` central broker entirely, enabling **fully distributed** peer-to-peer communication.
+- They added **Quality-of-Service (QoS)** policies for reliability, latency, and history.
+- They built native support for **Windows, macOS, and Linux**.
+- They designed the API in modern C++ (C++17) and Python 3.
+
+ROS 2 Humble Hawksbill (2022) became the first Long-Term Support (LTS) release, and ROS 2 is now the recommended choice for all new projects.
+
+---
+
+## 1.3 The Architecture of ROS 2
+
+Understanding the layers of ROS 2 is essential for reasoning about performance, reliability, and debugging. The architecture can be described as a stack of four layers:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Your Robot Application                │
+│         (Nodes: perception, planning, control)          │
+├─────────────────────────────────────────────────────────┤
+│              rclcpp / rclpy  (Client Libraries)         │
+│   The API you write code against — C++ and Python       │
+├─────────────────────────────────────────────────────────┤
+│                    rcl  (ROS Client Library)             │
+│        Language-agnostic C implementation of ROS 2      │
+├─────────────────────────────────────────────────────────┤
+│              rmw  (ROS Middleware Interface)             │
+│        Abstraction layer over the DDS implementation    │
+├─────────────────────────────────────────────────────────┤
+│           DDS Implementation (e.g. FastDDS, CycloneDDS) │
+│     The actual transport: discovery, serialisation,     │
+│                 QoS, and network I/O                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Layer 1: DDS — The Foundation
+
+**Data Distribution Service (DDS)** is an OMG (Object Management Group) standard for real-time, scalable, anonymous publish-subscribe communication. It handles:
+
+- **Automatic Discovery**: DDS nodes discover each other using the RTPS (Real-Time Publish-Subscribe) protocol. No broker is needed.
+- **Serialisation**: Messages are converted to bytes and back using IDL (Interface Definition Language).
+- **Quality of Service**: Publishers and subscribers negotiate policies such as reliability, deadline, and lifespan.
+
+ROS 2 ships with support for multiple DDS implementations, selectable at runtime. The most common are **eProsima FastDDS** (the default) and **Eclipse CycloneDDS** (popular in robotics platforms like Nav2).
+
+### Layer 2: rmw — The Abstraction
+
+The **ROS Middleware Interface (rmw)** is a set of C function signatures that every DDS vendor must implement. This allows ROS 2 to swap the underlying DDS vendor without changing your application code. You select the vendor with the `RMW_IMPLEMENTATION` environment variable:
+
+```bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+```
+
+### Layer 3: rcl — The Core
+
+**rcl** (ROS Client Library) implements all the ROS 2 concepts — nodes, topics, services, actions, parameters, timers — on top of rmw. It is written in C and forms the single source of truth for ROS 2 semantics.
+
+### Layer 4: rclpy / rclcpp — Your API
+
+**rclpy** (Python) and **rclcpp** (C++) are thin wrappers over rcl that expose an idiomatic API in their respective languages. As a Python AI practitioner, you will spend most of your time with **rclpy**.
+
+---
+
+## 1.4 Core ROS 2 Concepts
+
+Before diving into code, it is essential to understand the six fundamental abstractions that ROS 2 provides. You will study each in depth in later chapters.
+
+### Nodes
+
+A **node** is a single executable process that performs one specific task. In the biological analogy, a node is like a single neuron. Examples:
+
+- A camera driver node reads frames from a USB camera and publishes them
+- A face-detection node subscribes to camera frames and publishes bounding boxes
+- A robot arm controller node subscribes to target poses and sends motor commands
+
+Nodes are the primary unit of composition in ROS 2. A healthy system is many small, focused nodes — not one monolithic program.
+
+### Topics
+
+A **topic** is a named data channel. Nodes **publish** to topics and **subscribe** to topics. Communication is anonymous and asynchronous:
+
+```
+[Camera Node]  ──publish──▶  /camera/image_raw  ──subscribe──▶  [Detector Node]
+                                                ──subscribe──▶  [Recorder Node]
+```
+
+Topics use a **many-to-many** model: multiple publishers can send to one topic, and multiple subscribers can receive from it simultaneously.
+
+### Services
+
+A **service** is a synchronous **request/response** call, similar to a function call across nodes. One node acts as the server (waits for requests) and others act as clients (send requests and wait for responses).
+
+```
+[Navigation Node]  ──request──▶  /compute_path  ──response──▶  [Navigation Node]
+                                     (Path Planning Server)
+```
+
+Services are suitable for infrequent, blocking operations like "plan a path" or "take a photo".
+
+### Actions
+
+An **action** is a long-running task with **feedback** and the ability to be **cancelled**. It combines a goal (like a service request), periodic feedback (streaming like a topic), and a final result. Actions are ideal for "move the arm to this position" style commands.
+
+### Parameters
+
+**Parameters** are runtime-configurable values associated with a node. They allow operators to tune behaviour without recompiling. For example, a navigation node might expose a `max_speed` parameter.
+
+### The Computation Graph
+
+Together, nodes, topics, services, and actions form the **ROS 2 Computation Graph** — a live, introspectable network of communicating processes. ROS 2 tools let you visualise and query this graph at runtime:
+
+```bash
+ros2 node list          # List all active nodes
+ros2 topic list         # List all active topics
+ros2 topic echo /odom   # Print messages on a topic in real-time
+ros2 service list       # List all active services
+ros2 node info /my_node # Show a node's publishers, subscribers, and services
+```
+
+---
+
+## 1.5 ROS 2 vs. ROS 1: A Detailed Comparison
+
+For students who have encountered ROS 1, or who will read legacy tutorials online, the following table highlights the most important differences:
+
+| Feature | ROS 1 | ROS 2 |
+|---|---|---|
+| **Transport** | Custom TCPROS/UDPROS | DDS (standard) |
+| **Discovery** | `rosmaster` (centralised) | RTPS automatic (peer-to-peer) |
+| **Real-time** | Not supported | Supported (with RTOS integration) |
+| **Security** | None | SROS2 (DDS Security) |
+| **QoS Policies** | None | Full DDS QoS suite |
+| **OS Support** | Ubuntu only | Linux, Windows, macOS, RTOS |
+| **Language** | Python 2, C++ | Python 3, C++17 |
+| **Lifecycle** | No managed lifecycle | Managed node lifecycle |
+| **Build System** | catkin | ament (+ colcon) |
+| **Intra-process Comms** | Serialised (slow) | Zero-copy optimisation |
+| **Multi-robot** | Difficult (one master per network) | Native (namespaces + DDS domains) |
+
+### Migration from ROS 1
+
+If you ever need to connect legacy ROS 1 systems to a ROS 2 network, a tool called the **ros1_bridge** package provides bidirectional topic and service bridging.
+
+---
+
+## 1.6 The ROS 2 Lifecycle: Managed Nodes
+
+One of ROS 2's most important production features is the **managed node lifecycle**. In ROS 1, nodes either ran or crashed; there was no standard way to start them up gracefully, configure them, or shut them down cleanly.
+
+ROS 2 introduces a state machine for nodes:
+
+```
+     [Unconfigured]
+           │  configure()
+           ▼
+      [Inactive]
+           │  activate()
+           ▼
+       [Active]   ◀──────── (normal operation)
+           │  deactivate()
+           ▼
+      [Inactive]
+           │  cleanup()
+           ▼
+     [Unconfigured]
+           │  shutdown()
+           ▼
+   [Finalized / Destroyed]
+```
+
+Lifecycle nodes are used extensively in navigation, manipulation, and safety-critical systems, where an operator must be able to bring components online and offline in a controlled sequence.
+
+---
+
+## 1.7 Setting Up Your ROS 2 Environment
+
+### Supported Distributions
+
+ROS 2 releases are named after turtles and follow a predictable cadence. For new projects, use:
+
+- **ROS 2 Humble Hawksbill** — LTS, supported until May 2027, Ubuntu 22.04
+- **ROS 2 Jazzy Jalisco** — Current LTS (2024), Ubuntu 24.04
+
+### Installation Summary
+
+Full installation instructions are at [docs.ros.org](https://docs.ros.org). The condensed steps on Ubuntu 22.04 for Humble are:
+
+```bash
+# 1. Set locale
+sudo locale-gen en_US en_US.UTF-8
+sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+
+# 2. Add the ROS 2 apt repository
+sudo apt install software-properties-common
+sudo add-apt-repository universe
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+     -o /usr/share/keyrings/ros-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+     http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+     | sudo tee /etc/apt/sources.list.d/ros2.list
+
+# 3. Install
+sudo apt update && sudo apt install ros-humble-desktop
+
+# 4. Source the setup file (add to ~/.bashrc for persistence)
+source /opt/ros/humble/setup.bash
+```
+
+### Verifying Your Installation
+
+```bash
+# Start a demo talker (publisher) in one terminal
+ros2 run demo_nodes_py talker
+
+# In a second terminal, start a listener (subscriber)
+ros2 run demo_nodes_py listener
+
+# You should see: [INFO] [talker]: Publishing: "Hello World: 1"
+#                 [INFO] [listener]: I heard: "Hello World: 1"
+```
+
+If you see this output, your ROS 2 installation is working correctly.
+
+---
+
+## 1.8 The DDS Domain: Multi-Robot and Multi-User Environments
+
+DDS uses the concept of a **Domain ID** to isolate communication networks. All ROS 2 processes that share a domain ID can communicate; processes in different domains are completely isolated.
+
+```bash
+# Set domain ID (default is 0)
+export ROS_DOMAIN_ID=42
+```
+
+This is invaluable when:
+- Multiple students are working on the same lab network (each uses a unique domain)
+- A robot has a public interface and a private control network
+- You are running simulated and physical robots simultaneously
+
+---
+
+## 1.9 Chapter Summary
+
+In this chapter, we established the foundations for everything that follows:
+
+1. **ROS 2 is a middleware framework** — not an OS — that provides standardised communication, tooling, and libraries for building robot software.
+
+2. **ROS 2 was created to fix ROS 1's production limitations**: no central broker, real-time support, security, multi-platform, and Python 3.
+
+3. **The architecture has four layers**: DDS (transport), rmw (abstraction), rcl (core semantics), and rclpy/rclcpp (your API).
+
+4. **The six core abstractions** — nodes, topics, services, actions, parameters, and the computation graph — form the conceptual vocabulary of all ROS 2 programming.
+
+5. **Managed lifecycle nodes** give operators fine-grained control over node state in production deployments.
+
+In the next chapter, we will write our first ROS 2 Python code, implementing publishers, subscribers, and services using rclpy.
+
+---
+
+## Review Questions
+
+1. Explain in your own words why a centralised broker (like ROS 1's `rosmaster`) is a liability in a production robot system. What happens if it crashes?
+
+2. What is the role of the rmw layer? Why is it architecturally important to have an abstraction between rcl and the DDS implementation?
+
+3. A teammate argues that for a university research project, ROS 1 is "good enough" because ROS 2 is harder to learn. List three concrete technical reasons why you would still recommend ROS 2 for a new project.
+
+4. Describe a scenario — in a real-world robot application — where QoS policies would be critical. Which QoS policy (reliability, deadline, lifespan, etc.) would matter most in your scenario?
+
+5. What command would you run to see all topics currently active in a running ROS 2 system? How would you inspect the messages flowing on a specific topic?

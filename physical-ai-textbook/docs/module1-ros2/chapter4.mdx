@@ -1,0 +1,1118 @@
+---
+title: "Chapter 4: Bridging Python AI Agents to ROS 2"
+sidebar_position: 4
+---
+
+# Chapter 4: Bridging Python AI Agents to ROS 2
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Design the software architecture that connects an AI reasoning agent to a physical or simulated robot via ROS 2
+- Build a ROS 2 node that wraps an AI model (LLM or vision model) and translates its outputs into robot commands
+- Understand the URDF robot description format and read a simplified humanoid URDF
+- Implement an action-based command interface suitable for high-level AI control
+- Apply safety patterns — watchdogs, velocity limits, state machines — to prevent runaway AI control loops
+- Reason about the latency and timing constraints of AI-in-the-loop robot control
+
+---
+
+## 4.1 The Core Challenge: Two Different Worlds
+
+An AI agent and a robot live in fundamentally different time domains:
+
+```
+AI Agent World                    Robot World
+─────────────────────             ─────────────────────
+Operates at 1–10 Hz               Operates at 100–1000 Hz
+Handles natural language          Handles sensor streams
+Thinks in high-level goals        Thinks in joint torques
+Has uncertain, slow inference     Has hard real-time deadlines
+Python / CUDA / NumPy             C++, ROS 2, safety systems
+```
+
+The job of the **AI-ROS 2 bridge** is to translate between these two worlds gracefully:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        AI Agent Layer                        │
+│   (LLM, Vision Model, Planning Algorithm, Reward Function)   │
+│                    Python / PyTorch / Numpy                  │
+└───────────────────┬──────────────────────────────────────────┘
+                    │  high-level commands (JSON, natural language,
+                    │  goal poses, skill names)
+┌───────────────────▼──────────────────────────────────────────┐
+│                   AI-ROS 2 Bridge Node                       │
+│   - Translates AI intent → ROS 2 messages                   │
+│   - Buffers and rate-limits commands                         │
+│   - Monitors safety constraints                              │
+│   - Reports robot state back to the AI                       │
+└───────────────────┬──────────────────────────────────────────┘
+                    │  ROS 2 topics, services, actions
+┌───────────────────▼──────────────────────────────────────────┐
+│                    Robot Control Stack                       │
+│   (nav2, MoveIt2, hardware drivers, joint controllers)       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4.2 URDF: Describing the Robot Body
+
+Before commanding a robot, you need to know what it looks like. The **Unified Robot Description Format (URDF)** is an XML-based language that describes a robot's physical structure.
+
+### Core URDF Concepts
+
+A URDF consists of **links** (rigid bodies — limbs, torso, head) and **joints** (the connections between links that define allowable motion).
+
+```
+link: right_hand
+joint: right_wrist  (connects right_forearm → right_hand)
+link: right_forearm
+joint: right_elbow  (connects right_upper_arm → right_forearm)
+link: right_upper_arm
+joint: right_shoulder  (connects torso → right_upper_arm)
+link: torso
+   ↑ root link (base_link)
+```
+
+### A Minimal Humanoid URDF
+
+```xml
+<?xml version="1.0"?>
+<robot name="simple_humanoid">
+
+  <!-- ═══════ BASE (Torso) ═══════ -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.3 0.2 0.5"/>  <!-- width depth height in metres -->
+      </geometry>
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.3 0.2 0.5"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="20.0"/>  <!-- kg -->
+      <inertia ixx="0.5" ixy="0" ixz="0" iyy="0.5" iyz="0" izz="0.3"/>
+    </inertial>
+  </link>
+
+  <!-- ═══════ HEAD ═══════ -->
+  <link name="head">
+    <visual>
+      <geometry>
+        <sphere radius="0.12"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <mass value="3.0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.02"/>
+    </inertial>
+  </link>
+
+  <!-- Neck joint: connects torso to head -->
+  <joint name="neck_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="head"/>
+    <!-- Origin of joint relative to parent link -->
+    <origin xyz="0.0 0.0 0.37" rpy="0 0 0"/>
+    <!-- Rotation axis (z = yaw, y = pitch, x = roll) -->
+    <axis xyz="0 0 1"/>
+    <!-- Joint limits: lower=-1.57 to upper=1.57 radians (±90°) -->
+    <limit lower="-1.57" upper="1.57" effort="10.0" velocity="1.0"/>
+    <!-- Dynamics: damping and friction -->
+    <dynamics damping="0.1" friction="0.01"/>
+  </joint>
+
+  <!-- ═══════ LEFT ARM ═══════ -->
+  <link name="left_upper_arm">
+    <visual>
+      <geometry>
+        <cylinder radius="0.04" length="0.30"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <mass value="2.5"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.005"/>
+    </inertial>
+  </link>
+
+  <joint name="left_shoulder_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="left_upper_arm"/>
+    <origin xyz="0.20 0.0 0.15" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>  <!-- Pitches forward/backward -->
+    <limit lower="-3.14" upper="3.14" effort="50.0" velocity="2.0"/>
+    <dynamics damping="0.3" friction="0.02"/>
+  </joint>
+
+  <link name="left_forearm">
+    <visual>
+      <geometry>
+        <cylinder radius="0.035" length="0.28"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <mass value="1.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.003"/>
+    </inertial>
+  </link>
+
+  <joint name="left_elbow_joint" type="revolute">
+    <parent link="left_upper_arm"/>
+    <child link="left_forearm"/>
+    <origin xyz="0.0 0.0 -0.30" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="2.617" effort="30.0" velocity="2.0"/>
+    <dynamics damping="0.2" friction="0.01"/>
+  </joint>
+
+  <link name="left_hand">
+    <visual>
+      <geometry>
+        <box size="0.08 0.12 0.04"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <mass value="0.5"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <joint name="left_wrist_joint" type="revolute">
+    <parent link="left_forearm"/>
+    <child link="left_hand"/>
+    <origin xyz="0.0 0.0 -0.28" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.57" upper="1.57" effort="10.0" velocity="2.0"/>
+    <dynamics damping="0.1" friction="0.005"/>
+  </joint>
+
+</robot>
+```
+
+### Joint Types
+
+| Type | Description | Degrees of Freedom | Example |
+|---|---|---|---|
+| `fixed` | No movement | 0 | Sensor mounted on chassis |
+| `revolute` | Rotation within limits | 1 | Elbow, knee |
+| `continuous` | Unlimited rotation | 1 | Wheel |
+| `prismatic` | Linear motion within limits | 1 | Gripper finger |
+| `floating` | 6 DOF free motion | 6 | Floating base |
+
+### Viewing URDF in RViz2
+
+```bash
+# Publish the URDF and launch RViz2 to visualise the robot
+ros2 launch urdf_tutorial display.launch.py \
+    model:=$(pwd)/simple_humanoid.urdf
+```
+
+### The Robot State Publisher
+
+In a running system, a node called `robot_state_publisher` reads the URDF and publishes the transforms between links as `tf2` transforms, based on the current joint states:
+
+```bash
+ros2 run robot_state_publisher robot_state_publisher \
+    --ros-args -p robot_description:="$(cat simple_humanoid.urdf)"
+```
+
+---
+
+## 4.3 Architecture Patterns for AI-Robot Integration
+
+There are three main architectural patterns for connecting AI to ROS 2, each with different trade-offs.
+
+### Pattern A: The Reactive Agent (Topic-Based)
+
+The AI continuously reads sensor topics and publishes command topics. This is the simplest pattern and works well for high-frequency, reactive control (e.g., visual servoing).
+
+```
+Sensor Topics → AI Node → Command Topics → Robot
+(high frequency, low latency, no feedback)
+```
+
+**Best for**: Continuous, reactive tasks. Following a ball. Maintaining balance. Reactive collision avoidance.
+
+### Pattern B: The Goal-Directed Agent (Action-Based)
+
+The AI sets high-level goals via ROS 2 actions and waits for feedback and results. The robot's own controllers handle low-level execution.
+
+```
+AI Agent → Action Client → ROS 2 Action Server → Robot
+                         ← Feedback (progress updates) ←
+                         ← Result (success/failure)    ←
+```
+
+**Best for**: Task-level planning. "Pick up the red cup." "Navigate to room 5." This is the pattern used by navigation (Nav2) and manipulation (MoveIt 2) stacks.
+
+### Pattern C: The Hybrid Agent (Hierarchical)
+
+The AI operates at multiple time scales simultaneously. A slow LLM generates high-level plans; a fast reactive controller executes them.
+
+```
+LLM (1 Hz)  → Task Planner → Action Goals
+                                    ↓
+Perception (30 Hz) → Skill Controller → Velocity Commands
+                                    ↓
+                               Hardware (1000 Hz)
+```
+
+**Best for**: General-purpose humanoid robots that must reason and act simultaneously. This is the architecture used in systems like RT-2, OpenVLA, and similar VLA (Vision-Language-Action) models.
+
+---
+
+## 4.4 Building an LLM-Based Robot Controller
+
+Let's build Pattern B: an LLM agent that interprets text commands and translates them to robot motion via ROS 2 topics.
+
+The system has two nodes:
+1. **`llm_agent_node`** — wraps an LLM, receives text commands, outputs structured goals
+2. **`robot_executor_node`** — receives structured goals from the LLM, executes them as velocity commands
+
+### The Structured Command Interface
+
+First, define the interface between the LLM and the executor. We use a ROS 2 topic carrying a JSON-structured command. This is far more robust than parsing raw LLM text in the executor:
+
+```python
+# robot_command.py — shared data class
+from dataclasses import dataclass, field
+from typing import Optional
+import json
+
+@dataclass
+class RobotCommand:
+    """
+    Structured command output from the AI agent.
+    The LLM is prompted to generate valid JSON matching this schema.
+    """
+    action: str                      # "move", "turn", "stop", "wave_hand"
+    parameters: dict = field(default_factory=dict)
+    confidence: float = 1.0          # LLM confidence [0.0, 1.0]
+    explanation: str = ""            # LLM reasoning (for logging)
+
+    def to_json(self) -> str:
+        return json.dumps({
+            'action': self.action,
+            'parameters': self.parameters,
+            'confidence': self.confidence,
+            'explanation': self.explanation,
+        })
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'RobotCommand':
+        data = json.loads(json_str)
+        return cls(**data)
+```
+
+### Node 1: The LLM Agent Node
+
+```python
+# llm_agent_node.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import json
+import re
+
+# In a real system, replace this with your actual LLM client:
+# from anthropic import Anthropic
+# from openai import OpenAI
+
+class LLMAgentNode(Node):
+    """
+    Wraps an LLM (e.g. Claude, GPT-4) and translates
+    natural-language commands into structured robot commands.
+    """
+
+    SYSTEM_PROMPT = """You are a robot controller AI.
+You receive natural language instructions and output ONLY valid JSON
+describing the robot action to take.
+
+Valid actions and their parameters:
+  - move:      {"distance": float (metres), "speed": float (m/s, max 0.5)}
+  - turn:      {"angle": float (radians, positive=left), "speed": float (rad/s, max 1.0)}
+  - stop:      {}
+  - wave_hand: {"hand": "left"|"right", "repetitions": int}
+  - nod:       {"repetitions": int}
+
+Output format (JSON only, no prose):
+{
+  "action": "<action_name>",
+  "parameters": {<action params>},
+  "confidence": <0.0-1.0>,
+  "explanation": "<brief reasoning>"
+}
+
+Examples:
+User: "Walk forward 2 metres"
+{"action": "move", "parameters": {"distance": 2.0, "speed": 0.3},
+ "confidence": 0.98, "explanation": "Direct forward movement command"}
+
+User: "Turn left 90 degrees"
+{"action": "turn", "parameters": {"angle": 1.5708, "speed": 0.5},
+ "confidence": 0.95, "explanation": "90 degrees = pi/2 radians, left = positive"}
+
+User: "Stop immediately"
+{"action": "stop", "parameters": {},
+ "confidence": 1.0, "explanation": "Emergency stop requested"}
+"""
+
+    def __init__(self):
+        super().__init__('llm_agent')
+
+        # Publisher: sends structured commands to the executor
+        self.command_pub = self.create_publisher(
+            String, '/robot/llm_command', 10
+        )
+
+        # Subscriber: receives raw text commands (from a UI, voice, etc.)
+        self.instruction_sub = self.create_subscription(
+            String,
+            '/robot/instruction',
+            self.instruction_callback,
+            10
+        )
+
+        # Subscriber: receives robot state for context
+        self.state_sub = self.create_subscription(
+            String,
+            '/robot/state',
+            self.state_callback,
+            10
+        )
+
+        self.current_state = {}
+
+        self.get_logger().info('LLM Agent node started. Waiting for instructions...')
+
+    def state_callback(self, msg: String):
+        """Update our model of the current robot state."""
+        try:
+            self.current_state = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.get_logger().warn('Received invalid state JSON.')
+
+    def instruction_callback(self, msg: String):
+        """
+        Called when a new text instruction arrives.
+        Queries the LLM and publishes the structured command.
+        """
+        instruction = msg.data
+        self.get_logger().info(f'Received instruction: "{instruction}"')
+
+        try:
+            command_json = self.query_llm(instruction)
+            self.validate_and_publish(command_json)
+        except Exception as e:
+            self.get_logger().error(f'LLM query failed: {e}')
+            # Publish a stop command as a safety fallback
+            stop_cmd = json.dumps({
+                'action': 'stop',
+                'parameters': {},
+                'confidence': 1.0,
+                'explanation': 'LLM error fallback'
+            })
+            out_msg = String()
+            out_msg.data = stop_cmd
+            self.command_pub.publish(out_msg)
+
+    def query_llm(self, instruction: str) -> str:
+        """
+        Sends the instruction to the LLM and returns the JSON response.
+
+        Replace this stub with a real API call:
+
+        client = Anthropic()
+        message = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=256,
+            system=self.SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"Robot state: {json.dumps(self.current_state)}\n"
+                           f"Instruction: {instruction}"
+            }]
+        )
+        return message.content[0].text
+        """
+        # --- STUB for illustration (deterministic fake LLM) ---
+        instruction_lower = instruction.lower()
+
+        if 'forward' in instruction_lower or 'walk' in instruction_lower:
+            dist = self._extract_number(instruction, default=1.0)
+            return json.dumps({
+                'action': 'move',
+                'parameters': {'distance': dist, 'speed': 0.3},
+                'confidence': 0.92,
+                'explanation': f'Move forward {dist}m'
+            })
+        elif 'turn left' in instruction_lower:
+            angle = self._extract_number(instruction, default=1.5708)
+            return json.dumps({
+                'action': 'turn',
+                'parameters': {'angle': angle, 'speed': 0.5},
+                'confidence': 0.90,
+                'explanation': 'Turn left'
+            })
+        elif 'turn right' in instruction_lower:
+            angle = self._extract_number(instruction, default=1.5708)
+            return json.dumps({
+                'action': 'turn',
+                'parameters': {'angle': -angle, 'speed': 0.5},
+                'confidence': 0.90,
+                'explanation': 'Turn right (negative angle)'
+            })
+        elif 'stop' in instruction_lower:
+            return json.dumps({
+                'action': 'stop',
+                'parameters': {},
+                'confidence': 1.0,
+                'explanation': 'Stop command'
+            })
+        elif 'wave' in instruction_lower:
+            hand = 'left' if 'left' in instruction_lower else 'right'
+            return json.dumps({
+                'action': 'wave_hand',
+                'parameters': {'hand': hand, 'repetitions': 3},
+                'confidence': 0.85,
+                'explanation': f'Wave {hand} hand'
+            })
+        else:
+            return json.dumps({
+                'action': 'stop',
+                'parameters': {},
+                'confidence': 0.3,
+                'explanation': 'Unclear instruction, defaulting to stop'
+            })
+
+    def _extract_number(self, text: str, default: float) -> float:
+        """Extract the first number found in a string."""
+        numbers = re.findall(r'\d+\.?\d*', text)
+        return float(numbers[0]) if numbers else default
+
+    def validate_and_publish(self, command_json: str):
+        """Validate the LLM output before publishing."""
+        try:
+            cmd = json.loads(command_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(f'LLM returned invalid JSON: {e}')
+
+        # Safety check: reject commands with low confidence
+        if cmd.get('confidence', 0) < 0.5:
+            self.get_logger().warn(
+                f'Low confidence command ({cmd["confidence"]:.2f}), '
+                f'sending stop instead.'
+            )
+            cmd = {'action': 'stop', 'parameters': {},
+                   'confidence': 1.0, 'explanation': 'Low confidence fallback'}
+
+        # Safety check: clip any speed parameters to safe limits
+        if 'parameters' in cmd:
+            if 'speed' in cmd['parameters']:
+                cmd['parameters']['speed'] = min(
+                    cmd['parameters']['speed'], 0.5  # Hard limit: 0.5 m/s
+                )
+
+        out_msg = String()
+        out_msg.data = json.dumps(cmd)
+        self.command_pub.publish(out_msg)
+        self.get_logger().info(
+            f'Published command: {cmd["action"]} '
+            f'(confidence: {cmd.get("confidence", "?"):.2f})'
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LLMAgentNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+### Node 2: The Robot Executor Node
+
+```python
+# robot_executor_node.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from geometry_msgs.msg import Twist
+import json
+import math
+
+class RobotExecutorNode(Node):
+    """
+    Receives structured commands from the LLM agent and
+    executes them as ROS 2 velocity commands.
+
+    Implements a simple state machine:
+    IDLE → EXECUTING → IDLE
+    """
+
+    def __init__(self):
+        super().__init__('robot_executor')
+
+        # State
+        self.state = 'IDLE'
+        self.current_command = None
+        self.ticks_remaining = 0
+        self.LOOP_HZ = 10.0
+
+        # Publisher: velocity commands to the robot base
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # Publisher: state feedback back to the AI agent
+        self.state_pub = self.create_publisher(String, '/robot/state', 10)
+
+        # Subscriber: receives commands from the LLM agent
+        self.command_sub = self.create_subscription(
+            String,
+            '/robot/llm_command',
+            self.command_callback,
+            10
+        )
+
+        # Control loop at 10 Hz
+        self.timer = self.create_timer(1.0 / self.LOOP_HZ, self.control_loop)
+
+        # Watchdog: if no command for 5 seconds, stop the robot
+        self.watchdog_timer = self.create_timer(5.0, self.watchdog_callback)
+        self.last_command_time = self.get_clock().now()
+
+        self.get_logger().info('Robot executor node started.')
+
+    def command_callback(self, msg: String):
+        """Receive and queue a new command from the LLM agent."""
+        try:
+            cmd = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.get_logger().error('Received invalid command JSON.')
+            return
+
+        action = cmd.get('action', 'stop')
+        params = cmd.get('parameters', {})
+
+        self.get_logger().info(f'Executing action: {action} params: {params}')
+
+        self.current_command = cmd
+        self.last_command_time = self.get_clock().now()
+
+        if action == 'stop':
+            self._enter_idle()
+        elif action == 'move':
+            distance = params.get('distance', 0.0)
+            speed = min(params.get('speed', 0.3), 0.5)
+            duration_ticks = int((distance / speed) * self.LOOP_HZ)
+            self._enter_executing(
+                linear_x=speed, angular_z=0.0,
+                ticks=duration_ticks
+            )
+        elif action == 'turn':
+            angle = params.get('angle', 0.0)    # radians
+            speed = min(abs(params.get('speed', 0.5)), 1.0)
+            direction = 1.0 if angle >= 0 else -1.0
+            duration_ticks = int((abs(angle) / speed) * self.LOOP_HZ)
+            self._enter_executing(
+                linear_x=0.0, angular_z=direction * speed,
+                ticks=duration_ticks
+            )
+        elif action == 'wave_hand':
+            # For arm actions, log and send a joint command (simplified here)
+            repetitions = params.get('repetitions', 3)
+            hand = params.get('hand', 'right')
+            self.get_logger().info(
+                f'Wave action: {hand} hand, {repetitions} times '
+                f'(joint commands omitted in this example)'
+            )
+            self._enter_idle()
+        else:
+            self.get_logger().warn(f'Unknown action: {action}. Stopping.')
+            self._enter_idle()
+
+    def _enter_idle(self):
+        self.state = 'IDLE'
+        self.ticks_remaining = 0
+        self._publish_zero_velocity()
+
+    def _enter_executing(self, linear_x: float, angular_z: float, ticks: int):
+        self.state = 'EXECUTING'
+        self.execute_linear_x = linear_x
+        self.execute_angular_z = angular_z
+        self.ticks_remaining = ticks
+
+    def control_loop(self):
+        """Called at LOOP_HZ. Manages the execution state machine."""
+        if self.state == 'EXECUTING':
+            if self.ticks_remaining > 0:
+                self._publish_velocity(
+                    self.execute_linear_x,
+                    self.execute_angular_z
+                )
+                self.ticks_remaining -= 1
+            else:
+                self.get_logger().info('Command complete. Returning to IDLE.')
+                self._enter_idle()
+                self._publish_state()
+
+    def watchdog_callback(self):
+        """Stop the robot if no command has been received recently."""
+        elapsed = (self.get_clock().now() - self.last_command_time).nanoseconds / 1e9
+        if elapsed > 5.0 and self.state == 'EXECUTING':
+            self.get_logger().warn(
+                f'Watchdog: no command for {elapsed:.1f}s. Emergency stop.'
+            )
+            self._enter_idle()
+
+    def _publish_velocity(self, linear_x: float, angular_z: float):
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(msg)
+
+    def _publish_zero_velocity(self):
+        self._publish_velocity(0.0, 0.0)
+
+    def _publish_state(self):
+        """Publish current robot state for the AI agent to observe."""
+        state = {
+            'executor_state': self.state,
+            'ticks_remaining': self.ticks_remaining,
+        }
+        msg = String()
+        msg.data = json.dumps(state)
+        self.state_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RobotExecutorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node._enter_idle()  # Safety: stop on Ctrl+C
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 4.5 Testing the System End-to-End
+
+```bash
+# Terminal 1: Run the LLM agent
+ros2 run my_robot_pkg llm_agent
+
+# Terminal 2: Run the executor
+ros2 run my_robot_pkg robot_executor
+
+# Terminal 3: Monitor velocity commands
+ros2 topic echo /cmd_vel
+
+# Terminal 4: Send instructions to the agent
+ros2 topic pub /robot/instruction std_msgs/msg/String \
+    "data: 'Walk forward 2 metres'" --once
+
+ros2 topic pub /robot/instruction std_msgs/msg/String \
+    "data: 'Turn left 90 degrees'" --once
+
+ros2 topic pub /robot/instruction std_msgs/msg/String \
+    "data: 'Stop immediately'" --once
+```
+
+The computation graph now looks like:
+
+```
+/robot/instruction  ──▶  [llm_agent]  ──▶  /robot/llm_command  ──▶  [robot_executor]  ──▶  /cmd_vel
+                               ▲                                              │
+                               └──────────────  /robot/state  ◀──────────────┘
+```
+
+---
+
+## 4.6 Connecting a Real Vision-Language-Action Model
+
+The `llm_agent_node` above used a simple stub. Here is how to connect it to a real AI model using the Anthropic Python SDK:
+
+```python
+# Replace the query_llm() method with:
+from anthropic import Anthropic
+
+class LLMAgentNode(Node):
+    def __init__(self):
+        super().__init__('llm_agent')
+        # Initialise the Anthropic client
+        # Reads ANTHROPIC_API_KEY from environment
+        self.anthropic_client = Anthropic()
+        self.conversation_history = []
+        # ... rest of __init__ ...
+
+    def query_llm(self, instruction: str) -> str:
+        """Query Claude with full conversation history for context."""
+
+        # Build context message including current robot state
+        user_content = (
+            f"Current robot state: {json.dumps(self.current_state)}\n"
+            f"Instruction: {instruction}"
+        )
+
+        # Append to conversation history (multi-turn context)
+        self.conversation_history.append({
+            "role": "user",
+            "content": user_content
+        })
+
+        response = self.anthropic_client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=256,
+            system=self.SYSTEM_PROMPT,
+            messages=self.conversation_history
+        )
+
+        assistant_text = response.content[0].text
+
+        # Append assistant response to history
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": assistant_text
+        })
+
+        # Keep conversation history to last 20 turns to avoid token overflow
+        if len(self.conversation_history) > 40:
+            self.conversation_history = self.conversation_history[-40:]
+
+        return assistant_text
+```
+
+### Using Vision Input
+
+To give the LLM visual context of what the robot sees:
+
+```python
+import base64
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+
+class VisionLLMAgentNode(Node):
+    def __init__(self):
+        super().__init__('vision_llm_agent')
+        self.bridge = CvBridge()
+        self.latest_image_b64 = None
+        self.anthropic_client = Anthropic()
+
+        self.image_sub = self.create_subscription(
+            Image, '/camera/image_raw', self.image_callback, 1
+        )
+        # ... other setup ...
+
+    def image_callback(self, msg: Image):
+        """Convert ROS Image to base64 JPEG for the vision LLM."""
+        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        _, buffer = cv2.imencode('.jpg', cv_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        self.latest_image_b64 = base64.b64encode(buffer).decode('utf-8')
+
+    def query_llm_with_vision(self, instruction: str) -> str:
+        """Send both image and instruction to the vision LLM."""
+        content = [{"type": "text", "text": f"Instruction: {instruction}"}]
+
+        if self.latest_image_b64:
+            content.insert(0, {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": self.latest_image_b64,
+                },
+            })
+
+        response = self.anthropic_client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=256,
+            system=self.SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}]
+        )
+
+        return response.content[0].text
+```
+
+---
+
+## 4.7 Safety Design for AI-Controlled Robots
+
+Connecting an AI model to a physical robot introduces failure modes that do not exist in pure software systems. A responsible engineer must design for these explicitly.
+
+### Safety Layer Architecture
+
+```
+AI Output
+    │
+    ▼
+┌─────────────────────────────────────┐
+│         Safety Filter               │
+│  1. Schema validation (valid JSON?) │
+│  2. Confidence threshold check      │
+│  3. Velocity hard clipping          │
+│  4. Workspace boundary check        │
+│  5. Emergency stop override         │
+└─────────────────┬───────────────────┘
+                  │
+                  ▼
+         Robot Controllers
+```
+
+### Implementing a Velocity Safety Filter
+
+```python
+class SafetyFilter:
+    """
+    Validates and clips robot commands before execution.
+    This class should be used as a standalone component,
+    not mixed into the AI agent logic.
+    """
+
+    # Hard velocity limits — never exceed these regardless of AI output
+    MAX_LINEAR_SPEED = 0.5    # m/s
+    MAX_ANGULAR_SPEED = 1.0   # rad/s
+    MAX_DISTANCE = 5.0        # metres per command
+    MAX_ANGLE = 2 * 3.14159   # radians (one full rotation)
+
+    def validate(self, command: dict) -> tuple[bool, str, dict]:
+        """
+        Returns: (is_safe, reason, sanitised_command)
+        """
+        action = command.get('action', '')
+        params = command.get('parameters', {})
+
+        # Reject unknown actions
+        allowed_actions = {'move', 'turn', 'stop', 'wave_hand', 'nod'}
+        if action not in allowed_actions:
+            return False, f'Unknown action: {action}', {}
+
+        # Clip movement parameters
+        if action == 'move':
+            params['speed'] = min(
+                abs(params.get('speed', 0.3)),
+                self.MAX_LINEAR_SPEED
+            )
+            params['distance'] = min(
+                abs(params.get('distance', 0.0)),
+                self.MAX_DISTANCE
+            )
+
+        if action == 'turn':
+            params['speed'] = min(
+                abs(params.get('speed', 0.5)),
+                self.MAX_ANGULAR_SPEED
+            )
+            params['angle'] = max(
+                min(params.get('angle', 0.0), self.MAX_ANGLE),
+                -self.MAX_ANGLE
+            )
+
+        command['parameters'] = params
+        return True, 'OK', command
+```
+
+### The Watchdog Pattern
+
+A **watchdog** is a timer that triggers a safety action if it is not regularly "kicked" (reset). Use a watchdog whenever an AI is in control of a robot:
+
+```python
+class WatchdogNode(Node):
+    """
+    Independent safety node.
+    If no heartbeat is received for TIMEOUT_SECONDS,
+    publishes an emergency stop.
+    """
+    TIMEOUT_SECONDS = 2.0
+
+    def __init__(self):
+        super().__init__('safety_watchdog')
+
+        self.last_heartbeat = self.get_clock().now()
+        self.estop_pub = self.create_publisher(Twist, '/cmd_vel', 1)
+
+        # Heartbeat subscription (LLM agent publishes this)
+        self.heartbeat_sub = self.create_subscription(
+            String, '/llm_agent/heartbeat', self.heartbeat_callback, 10
+        )
+
+        # Check every 0.5 seconds
+        self.check_timer = self.create_timer(0.5, self.check_watchdog)
+
+        self.get_logger().warn(
+            f'Safety watchdog active. Timeout: {self.TIMEOUT_SECONDS}s'
+        )
+
+    def heartbeat_callback(self, msg):
+        self.last_heartbeat = self.get_clock().now()
+
+    def check_watchdog(self):
+        elapsed = (
+            self.get_clock().now() - self.last_heartbeat
+        ).nanoseconds / 1e9
+
+        if elapsed > self.TIMEOUT_SECONDS:
+            self.get_logger().error(
+                f'WATCHDOG TIMEOUT ({elapsed:.1f}s). Publishing E-STOP.'
+            )
+            self.estop_pub.publish(Twist())  # Zero velocity
+```
+
+---
+
+## 4.8 Complete Launch File for the AI Robot System
+
+```python
+# launch/ai_robot.launch.py
+from launch import LaunchDescription
+from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+
+def generate_launch_description():
+    return LaunchDescription([
+
+        DeclareLaunchArgument('use_sim', default_value='true'),
+
+        # 1. Robot state publisher (reads URDF, publishes TF)
+        Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='screen',
+            parameters=[{
+                'robot_description':
+                    open('simple_humanoid.urdf').read()
+            }],
+        ),
+
+        # 2. LLM Agent
+        Node(
+            package='my_robot_pkg',
+            executable='llm_agent',
+            name='llm_agent',
+            output='screen',
+        ),
+
+        # 3. Robot Executor
+        Node(
+            package='my_robot_pkg',
+            executable='robot_executor',
+            name='robot_executor',
+            output='screen',
+            parameters=[{
+                'max_linear_speed': 0.5,
+                'max_angular_speed': 1.0,
+            }],
+        ),
+
+        # 4. Safety Watchdog
+        Node(
+            package='my_robot_pkg',
+            executable='safety_watchdog',
+            name='safety_watchdog',
+            output='screen',
+        ),
+    ])
+```
+
+---
+
+## 4.9 Design Patterns and Best Practices
+
+### Principle 1: Separate Reasoning from Control
+
+Never put LLM API calls inside a high-frequency control loop. The LLM operates at 1–2 Hz; the controller operates at 10–100 Hz. They belong in different nodes with well-defined interfaces.
+
+### Principle 2: Structured Output Over Free-Form Text
+
+Always prompt the LLM to output structured JSON and parse it programmatically. Avoid parsing natural language robot commands with regex — it breaks under edge cases. Validate the schema strictly.
+
+### Principle 3: The Stopwatch Rule
+
+If the AI has not confirmed a decision within N milliseconds, stop the robot. A stopped robot is safe; a robot executing an outdated command is dangerous.
+
+### Principle 4: Log Everything
+
+```python
+# Log the full LLM prompt and response for every command
+self.get_logger().debug(f'PROMPT: {prompt}')
+self.get_logger().debug(f'RESPONSE: {response}')
+self.get_logger().info(f'COMMAND: {command}')
+```
+
+Robot failures are often caused by unexpected AI outputs that occur rarely. Comprehensive logging allows post-hoc analysis.
+
+### Principle 5: Test in Simulation First
+
+Always develop AI-robot systems in a simulator (Gazebo, Isaac Sim, PyBullet) before running on hardware. The simulator lets you:
+- Run at accelerated speed (10× faster than real-time)
+- Reset the environment after crashes
+- Test edge cases safely
+
+---
+
+## 4.10 Chapter Summary
+
+This chapter assembled all previous knowledge into a complete AI-robot integration:
+
+1. **The AI-ROS 2 bridge** separates the AI reasoning layer (slow, Python, GPU) from the robot control layer (fast, C++, real-time) using well-defined topic and action interfaces.
+
+2. **URDF** describes the robot's physical structure as a tree of links and joints. Every joint has a type, limits, and dynamics. The `robot_state_publisher` broadcasts this as live TF transforms.
+
+3. **Three architectural patterns**: reactive (topic-based), goal-directed (action-based), and hierarchical (hybrid). Choose based on task requirements.
+
+4. **The LLM agent node** wraps an LLM API call, maintains conversation history, validates output, and publishes structured JSON commands. Vision input is added by converting ROS `Image` messages to base64 JPEGs.
+
+5. **Safety is not optional**: every AI-robot system needs velocity clipping, confidence thresholds, a watchdog timer, and comprehensive logging.
+
+6. **Develop in simulation first**. Only move to hardware after the AI-simulator loop is reliable.
+
+---
+
+## Module Summary
+
+You have completed Module 1: The Robotic Nervous System. Across these four chapters, you have:
+
+- Understood why ROS 2 was built and how its layered architecture (DDS → rmw → rcl → rclpy) provides reliability, security, and real-time capability
+- Written publisher, subscriber, service server, and service client nodes in Python
+- Structured professional ROS 2 packages with proper manifests, entry points, custom messages, and launch files
+- Designed and implemented a complete AI-robot integration — an LLM agent that commands a humanoid robot via structured ROS 2 topics, with safety filtering and watchdog monitoring
+
+In the next module, you will take these skills into a physics simulator, connecting your AI agent to a virtual humanoid robot in Gazebo and Isaac Sim.
+
+---
+
+## Review Questions
+
+1. Explain the two-layer architecture (LLM Agent + Robot Executor) used in this chapter. Why is it better to keep these as separate ROS 2 nodes rather than combining them into one?
+
+2. Examine the `SYSTEM_PROMPT` in `LLMAgentNode`. List three specific engineering decisions embedded in this prompt that affect the safety and reliability of the robot's behaviour.
+
+3. A colleague argues that you should simply give the LLM direct access to publish `Twist` messages and let it control `linear.x` and `angular.z` values directly. What are the risks of this approach compared to the structured command interface described in this chapter?
+
+4. Describe what would happen in the current system if: (a) the LLM API times out mid-operation; (b) the LLM outputs a `move` command with `speed: 99.0`; (c) the `robot_executor` node crashes. For each scenario, trace through the code and identify what safety mechanism (if any) handles it.
+
+5. Write a new action type `"pick_object"` for the `RobotCommand` schema. Define its parameters, add it to the `SYSTEM_PROMPT` example list, add handling code in `robot_executor_node.py`'s `command_callback`, and add the corresponding entry to the `SafetyFilter.validate()` method.

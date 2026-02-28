@@ -1,0 +1,1051 @@
+---
+title: "Chapter 4: Capstone Project — The Autonomous Humanoid"
+sidebar_position: 4
+---
+
+# Chapter 4: Capstone Project — The Autonomous Humanoid
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Design and implement the complete software stack for a voice-controlled autonomous humanoid robot
+- Integrate all prior modules: ROS 2 nodes, Isaac Sim simulation, Isaac ROS/Nav2 navigation, Whisper voice recognition, and LLM cognitive planning
+- Verify each integration layer independently before combining them into the full system
+- Write a comprehensive launch file that brings up the complete stack in a single command
+- Apply systematic debugging methodology when components fail to communicate
+- Extend the base system with additional capabilities: manipulation, multi-room navigation, and personality
+- Present your project as a university-level engineering deliverable
+
+---
+
+## 4.1 Project Overview
+
+The capstone project assembles everything from Modules 1–4 into a single working system: **an autonomous humanoid robot that can understand and execute voiced natural language commands in a simulated home environment.**
+
+### What the System Does
+
+```
+User says: "Hey Robot, go to the kitchen and get me a glass of water"
+    │
+    ▼ [Chapter 2] Whisper ASR
+"go to the kitchen and get me a glass of water"
+    │
+    ▼ [Chapter 3] LLM Planner (Claude)
+Plan: [speak confirm] → [navigate kitchen] → [scan] → [identify glass]
+      → [pick glass] → [navigate user] → [place glass] → [speak done]
+    │
+    ▼ [Module 3] Nav2 + cuVSLAM (or Isaac Sim)
+Robot navigates to kitchen, builds map, localises continuously
+    │
+    ▼ [Module 3] Isaac ROS Vision
+Object detection identifies glass, estimates 6-DoF pose
+    │
+    ▼ [Module 1] Manipulation ROS 2 nodes
+Robot picks up glass, carries it to user, places it
+    │
+    ▼
+User has water. Task complete.
+```
+
+### Full System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    AUTONOMOUS HUMANOID — FULL STACK                         │
+│                                                                             │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────────────┐   │
+│  │   Hardware   │   │  Simulation  │   │    Cognitive Layer           │   │
+│  │  (or Sim)    │   │  Isaac Sim   │   │                              │   │
+│  │              │   │  (Gazebo)    │   │  voice_command_node          │   │
+│  │  Stereo cam  │   │              │   │    (Whisper ASR)             │   │
+│  │  LiDAR       │   │  Physics:    │   │         │                    │   │
+│  │  IMU         │   │  PhysX       │   │         ▼                    │   │
+│  │  Joints      │   │  Rendering:  │   │  command_router_node         │   │
+│  └──────┬───────┘   │  RTX         │   │    (pattern matching)        │   │
+│         │           └──────┬───────┘   │         │                    │   │
+│         │                  │           │         ▼                    │   │
+│         ▼                  ▼           │  llm_planner_node            │   │
+│  ┌─────────────────────────────────┐   │    (Claude)                  │   │
+│  │   Sensor Processing Layer       │   │         │                    │   │
+│  │                                 │   └─────────┼────────────────────┘   │
+│  │  isaac_ros_visual_slam          │             │                         │
+│  │    → /visual_slam/odometry      │             │ /robot/instruction       │
+│  │                                 │             │ (String)                 │
+│  │  nvblox                         │             │                         │
+│  │    → /nvblox/occupancy          │   ┌─────────▼────────────────────┐   │
+│  │                                 │   │   Execution Layer            │   │
+│  │  isaac_ros_object_detection     │   │                              │   │
+│  │    → /detections                │   │  llm_planner_node            │   │
+│  │                                 │   │  (also does execution)       │   │
+│  │  robot_state_publisher          │   │    │                         │   │
+│  │    → /tf, /joint_states         │   │    ├─ Nav2 Action Client      │   │
+│  └─────────────────────────────────┘   │    ├─ Manipulation Client     │   │
+│                                        │    └─ /cmd_vel publisher      │   │
+│  ┌─────────────────────────────────┐   │                              │   │
+│  │   Navigation Layer              │   │  twist_to_gait_node          │   │
+│  │                                 │   │    → /gait/command           │   │
+│  │  Nav2 BT Navigator             │   └──────────────────────────────┘   │
+│  │  Planner (Smac Hybrid A*)       │                                       │
+│  │  Controller (DWB)               │   ┌──────────────────────────────┐   │
+│  │  Recoveries                     │   │   Safety Layer               │   │
+│  │  Costmap (global + local)       │   │                              │   │
+│  └─────────────────────────────────┘   │  safety_watchdog_node        │   │
+│                                        │  velocity_limiter_node       │   │
+│  ┌─────────────────────────────────┐   │  emergency_stop_node         │   │
+│  │   Monitoring (RViz2 + rqt)      │   └──────────────────────────────┘   │
+│  └─────────────────────────────────┘                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4.2 Project Setup
+
+### Repository Structure
+
+Create a new ROS 2 package for the capstone:
+
+```bash
+cd ~/ros2_ws/src
+
+ros2 pkg create --build-type ament_python \
+    --dependencies rclpy std_msgs geometry_msgs nav2_msgs \
+                   sensor_msgs tf2_ros tf2_geometry_msgs \
+    autonomous_humanoid_pkg
+```
+
+Organise the package:
+
+```
+autonomous_humanoid_pkg/
+├── package.xml
+├── setup.py
+├── setup.cfg
+├── autonomous_humanoid_pkg/
+│   ├── __init__.py
+│   ├── voice_command_node.py        ← Chapter 2
+│   ├── audio_capture.py             ← Chapter 2
+│   ├── wake_word_detector.py        ← Chapter 2
+│   ├── command_router_node.py       ← Chapter 2
+│   ├── llm_planner_node.py          ← Chapter 3
+│   ├── planner_prompts.py           ← Chapter 3
+│   ├── conversation_manager.py      ← Chapter 3
+│   ├── safety_watchdog_node.py      ← Module 1, Chapter 4
+│   ├── twist_to_gait_node.py        ← Module 3, Chapter 4
+│   └── text_to_speech_node.py       ← New: TTS output
+├── config/
+│   ├── nav2_params.yaml             ← Module 3, Chapter 4
+│   ├── planner_config.yaml          ← New: planner settings
+│   └── named_locations.yaml         ← New: map location database
+├── launch/
+│   ├── full_system.launch.py        ← Master launch file
+│   ├── simulation.launch.py         ← Isaac Sim / Gazebo
+│   ├── navigation.launch.py         ← Nav2 + VSLAM
+│   └── cognition.launch.py          ← Voice + Planner
+├── maps/
+│   └── home_environment.yaml        ← Pre-built map
+├── urdf/
+│   └── humanoid.urdf               ← Robot description
+└── test/
+    ├── test_voice_pipeline.py
+    ├── test_planner.py
+    └── test_integration.py
+```
+
+### Configuration Files
+
+```yaml
+# config/planner_config.yaml
+llm_planner:
+  ros__parameters:
+    model: "claude-opus-4-6"
+    max_tokens: 2048
+    max_retries: 2
+    dry_run: false
+    replan_max_attempts: 2
+
+voice_command_node:
+  ros__parameters:
+    whisper_model: "small"
+    language: "en"
+    use_wake_word: true
+    wake_word_timeout: 8.0
+
+command_router:
+  ros__parameters:
+    llm_threshold: true    # Forward ambiguous commands to LLM
+```
+
+```yaml
+# config/named_locations.yaml
+# Named locations in the home environment (map frame coordinates)
+locations:
+  home:       {x: 0.0,  y: 0.0,  yaw: 0.0}
+  kitchen:    {x: 3.5,  y: 2.0,  yaw: 0.0}
+  living_room:{x: 1.5,  y: -2.5, yaw: 1.57}
+  bedroom:    {x: 7.0,  y: 1.0,  yaw: 3.14}
+  bathroom:   {x: 6.0,  y: -1.5, yaw: -1.57}
+  front_door: {x: -2.0, y: 0.0,  yaw: 3.14}
+  charging:   {x: -1.0, y: 0.5,  yaw: 0.0}
+```
+
+---
+
+## 4.3 The Text-to-Speech Node
+
+The robot should be able to speak its status and confirmations. Here is a simple TTS node using the `pyttsx3` library (offline, no API required):
+
+```python
+# text_to_speech_node.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import threading
+import queue
+
+class TextToSpeechNode(Node):
+    """
+    Subscribes to /robot/speak and synthesises speech.
+    Uses pyttsx3 for offline, privacy-preserving TTS.
+    Install: pip install pyttsx3
+    """
+
+    def __init__(self):
+        super().__init__('text_to_speech')
+
+        self.declare_parameter('voice_rate', 150)   # Words per minute
+        self.declare_parameter('volume', 0.9)       # 0.0–1.0
+
+        self._speech_queue = queue.Queue()
+        self._engine = None
+        self._init_tts()
+
+        self.speak_sub = self.create_subscription(
+            String, '/robot/speak', self.speak_callback, 10
+        )
+
+        # Start TTS in background thread (pyttsx3 is not thread-safe)
+        self._tts_thread = threading.Thread(
+            target=self._tts_loop, daemon=True
+        )
+        self._tts_thread.start()
+
+        self.get_logger().info('TTS node started.')
+
+    def _init_tts(self):
+        try:
+            import pyttsx3
+            self._engine = pyttsx3.init()
+            self._engine.setProperty(
+                'rate', self.get_parameter('voice_rate').value
+            )
+            self._engine.setProperty(
+                'volume', self.get_parameter('volume').value
+            )
+            # Set a clear, neutral voice
+            voices = self._engine.getProperty('voices')
+            if voices:
+                self._engine.setProperty('voice', voices[0].id)
+        except Exception as e:
+            self.get_logger().warn(f'TTS init failed: {e}. Speech disabled.')
+
+    def speak_callback(self, msg: String):
+        text = msg.data.strip()
+        if text:
+            self._speech_queue.put(text)
+            self.get_logger().info(f'Queued speech: "{text}"')
+
+    def _tts_loop(self):
+        """Background thread: process speech queue one item at a time."""
+        while True:
+            text = self._speech_queue.get()
+            if text is None:
+                break
+            if self._engine:
+                try:
+                    self._engine.say(text)
+                    self._engine.runAndWait()
+                except Exception as e:
+                    self.get_logger().error(f'TTS error: {e}')
+
+    def destroy_node(self):
+        self._speech_queue.put(None)  # Signal shutdown
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TextToSpeechNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 4.4 The Named Locations Loader
+
+A utility node that reads the YAML location database and makes it available to other nodes via a service:
+
+```python
+# named_locations_service.py
+import rclpy
+from rclpy.node import Node
+from std_srvs.srv import Trigger
+import yaml
+import json
+import os
+from ament_index_python.packages import get_package_share_directory
+
+class NamedLocationsService(Node):
+    """
+    Loads named locations from YAML and serves them via a ROS 2 service.
+    Also publishes the location list on startup.
+    """
+
+    def __init__(self):
+        super().__init__('named_locations_service')
+
+        pkg_share = get_package_share_directory('autonomous_humanoid_pkg')
+        yaml_path = os.path.join(pkg_share, 'config', 'named_locations.yaml')
+
+        self.locations = self._load_locations(yaml_path)
+
+        # Service: returns all known locations as JSON
+        self.srv = self.create_service(
+            Trigger, '/robot/get_locations', self.handle_get_locations
+        )
+
+        # Publisher: broadcast on startup
+        from std_msgs.msg import String
+        self.pub = self.create_publisher(String, '/robot/known_locations', 1)
+        from std_msgs.msg import String
+        msg = String()
+        msg.data = json.dumps(self.locations)
+        # Publish after a brief delay (allow subscribers to connect)
+        self.create_timer(1.0, lambda: self.pub.publish(msg))
+
+        self.get_logger().info(
+            f'Loaded {len(self.locations)} named locations: '
+            f'{list(self.locations.keys())}'
+        )
+
+    def _load_locations(self, path: str) -> dict:
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f)
+            return data.get('locations', {})
+        except FileNotFoundError:
+            self.get_logger().warn(f'Location file not found: {path}')
+            return {}
+
+    def handle_get_locations(self, request, response):
+        response.success = True
+        response.message = json.dumps(self.locations)
+        return response
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = NamedLocationsService()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 4.5 The Master Launch File
+
+This launch file starts the complete system in the correct order, respecting dependencies:
+
+```python
+# launch/full_system.launch.py
+import os
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    TimerAction,
+    GroupAction,
+    LogInfo,
+)
+from launch.conditions import IfCondition, UnlessCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+
+PKG = 'autonomous_humanoid_pkg'
+NAV2_PKG = 'nav2_bringup'
+
+def generate_launch_description():
+    pkg_share = get_package_share_directory(PKG)
+    nav2_share = get_package_share_directory(NAV2_PKG)
+
+    # ── Launch Arguments ──────────────────────────────────────────────
+    use_sim_arg = DeclareLaunchArgument(
+        'use_sim', default_value='true',
+        description='true=Isaac Sim/Gazebo, false=real hardware'
+    )
+    use_voice_arg = DeclareLaunchArgument(
+        'use_voice', default_value='true',
+        description='Enable microphone voice input'
+    )
+    whisper_model_arg = DeclareLaunchArgument(
+        'whisper_model', default_value='small',
+        description='Whisper model size: tiny/base/small/medium/large'
+    )
+    dry_run_arg = DeclareLaunchArgument(
+        'dry_run', default_value='false',
+        description='Plan but do not execute (for testing)'
+    )
+
+    use_sim      = LaunchConfiguration('use_sim')
+    use_voice    = LaunchConfiguration('use_voice')
+    whisper_model = LaunchConfiguration('whisper_model')
+    dry_run      = LaunchConfiguration('dry_run')
+
+    params_file = os.path.join(pkg_share, 'config', 'nav2_params.yaml')
+    map_file    = os.path.join(pkg_share, 'maps', 'home_environment.yaml')
+    planner_cfg = os.path.join(pkg_share, 'config', 'planner_config.yaml')
+
+    # ── Layer 0: Robot Description ────────────────────────────────────
+    robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'robot_description':
+                open(os.path.join(pkg_share, 'urdf', 'humanoid.urdf')).read()
+        }],
+    )
+
+    # ── Layer 1: Simulation (conditional) ─────────────────────────────
+    simulation = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_share, 'launch', 'simulation.launch.py')
+        ),
+        condition=IfCondition(use_sim),
+    )
+
+    # ── Layer 2: Sensing and Mapping ──────────────────────────────────
+    # Delay 5s to allow simulation to initialise
+    sensing_layer = TimerAction(period=5.0, actions=[
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(pkg_share, 'launch', 'navigation.launch.py')
+            ),
+            launch_arguments={
+                'use_sim': use_sim,
+                'params_file': params_file,
+                'map': map_file,
+            }.items(),
+        ),
+    ])
+
+    # ── Layer 3: Safety (always starts early) ─────────────────────────
+    safety_watchdog = Node(
+        package=PKG,
+        executable='safety_watchdog_node',
+        name='safety_watchdog',
+        output='screen',
+    )
+
+    twist_to_gait = Node(
+        package=PKG,
+        executable='twist_to_gait_node',
+        name='twist_to_gait',
+        output='screen',
+    )
+
+    # ── Layer 4: Named Locations Service ──────────────────────────────
+    locations_service = Node(
+        package=PKG,
+        executable='named_locations_service',
+        name='named_locations',
+        output='screen',
+    )
+
+    # ── Layer 5: Cognition (voice + planner) — delay 10s ─────────────
+    cognition_layer = TimerAction(period=10.0, actions=[
+
+        # TTS always on (robot needs to speak even without mic)
+        Node(
+            package=PKG,
+            executable='text_to_speech_node',
+            name='tts',
+            output='screen',
+        ),
+
+        # Voice input (conditional on use_voice)
+        Node(
+            package=PKG,
+            executable='voice_command_node',
+            name='voice_input',
+            output='screen',
+            parameters=[{
+                'whisper_model': whisper_model,
+                'use_wake_word': True,
+            }],
+            condition=IfCondition(use_voice),
+        ),
+
+        # Command router
+        Node(
+            package=PKG,
+            executable='command_router_node',
+            name='command_router',
+            output='screen',
+        ),
+
+        # LLM planner
+        Node(
+            package=PKG,
+            executable='llm_planner_node',
+            name='llm_planner',
+            output='screen',
+            parameters=[
+                planner_cfg,
+                {'dry_run': dry_run},
+            ],
+        ),
+    ])
+
+    # ── Layer 6: Monitoring ───────────────────────────────────────────
+    rviz = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        arguments=['-d', os.path.join(pkg_share, 'config', 'full_system.rviz')],
+        output='screen',
+    )
+
+    return LaunchDescription([
+        # Arguments
+        use_sim_arg, use_voice_arg, whisper_model_arg, dry_run_arg,
+
+        # Startup log
+        LogInfo(msg='=== Autonomous Humanoid System Starting ==='),
+
+        # Layers (ordered by dependency)
+        robot_state_publisher,
+        simulation,
+        safety_watchdog,
+        twist_to_gait,
+        locations_service,
+        sensing_layer,     # Delayed 5s
+        cognition_layer,   # Delayed 10s
+        rviz,
+    ])
+```
+
+### Running the Full System
+
+```bash
+# Option A: With simulation (no real robot required)
+ros2 launch autonomous_humanoid_pkg full_system.launch.py \
+    use_sim:=true use_voice:=true whisper_model:=small
+
+# Option B: On real hardware
+ros2 launch autonomous_humanoid_pkg full_system.launch.py \
+    use_sim:=false use_voice:=true whisper_model:=medium
+
+# Option C: Dry run (test planning without execution)
+ros2 launch autonomous_humanoid_pkg full_system.launch.py \
+    use_sim:=true use_voice:=false dry_run:=true
+```
+
+---
+
+## 4.6 Integration Testing: The Verification Ladder
+
+Test each integration point systematically before testing the full stack. This approach isolates failures to a specific layer.
+
+```
+Rung 6: Full pipeline end-to-end
+    "Hey Robot, go to the kitchen"
+    ↑
+Rung 5: LLM Planner → Nav2
+    ros2 topic pub /robot/instruction ... "navigate to kitchen"
+    ↑
+Rung 4: Nav2 navigation
+    ros2 action send_goal /navigate_to_pose ...
+    ↑
+Rung 3: Voice → Planner
+    ros2 topic pub /voice/command ... "go to the kitchen"
+    ↑
+Rung 2: Whisper transcription
+    python3 -c "import whisper; m=whisper.load_model('small'); print(m.transcribe('test.wav'))"
+    ↑
+Rung 1: ROS 2 system
+    ros2 run demo_nodes_py talker
+    ros2 run demo_nodes_py listener
+```
+
+### Rung 1: ROS 2 Sanity Check
+
+```bash
+# Verify the workspace is built and sourced
+colcon build --packages-select autonomous_humanoid_pkg
+source ~/ros2_ws/install/setup.bash
+
+# Verify all nodes can be listed
+ros2 run autonomous_humanoid_pkg llm_planner_node &
+ros2 node list | grep llm_planner
+# Expected: /llm_planner
+```
+
+### Rung 3: Voice → Planner Integration Test
+
+```python
+# test/test_integration.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import threading
+import time
+import pytest
+
+class IntegrationTester(Node):
+    def __init__(self):
+        super().__init__('integration_tester')
+        self.received_plans = []
+
+        self.voice_pub = self.create_publisher(
+            String, '/voice/command', 10
+        )
+        self.plan_sub = self.create_subscription(
+            String, '/planner/current_plan', self.plan_callback, 10
+        )
+
+    def plan_callback(self, msg: String):
+        import json
+        plan = json.loads(msg.data)
+        self.received_plans.append(plan)
+
+    def send_voice_command(self, text: str):
+        msg = String()
+        msg.data = text
+        self.voice_pub.publish(msg)
+
+@pytest.fixture(autouse=True)
+def ros_context():
+    rclpy.init()
+    yield
+    rclpy.shutdown()
+
+def test_voice_to_plan_pipeline():
+    """Test that a voice command produces a valid plan."""
+    tester = IntegrationTester()
+
+    # Send command
+    tester.send_voice_command("go to the kitchen")
+
+    # Spin for up to 15 seconds waiting for a plan
+    deadline = time.time() + 15.0
+    while time.time() < deadline and not tester.received_plans:
+        rclpy.spin_once(tester, timeout_sec=0.1)
+
+    assert len(tester.received_plans) > 0, "No plan received within 15s"
+
+    plan = tester.received_plans[0]
+    assert 'steps' in plan
+    assert len(plan['steps']) > 0
+
+    # Check that navigation step is present
+    actions = [s['action'] for s in plan['steps']]
+    assert 'navigate_to_named' in actions, (
+        f"Expected navigate_to_named in plan, got: {actions}"
+    )
+
+    tester.destroy_node()
+```
+
+---
+
+## 4.7 Debugging Common Failures
+
+### Failure: Voice command node transcribes nothing
+
+```bash
+# Check microphone is detected
+python3 -c "import sounddevice as sd; print(sd.query_devices())"
+
+# Check Whisper can transcribe a test file
+python3 -c "
+import whisper
+m = whisper.load_model('small')
+r = m.transcribe('test_audio.wav', language='en')
+print(r['text'])
+"
+
+# Check the ROS 2 topic is publishing
+ros2 topic echo /voice/raw     # Should show raw transcription
+ros2 topic echo /voice/status  # Should cycle IDLE→TRANSCRIBING→IDLE
+```
+
+### Failure: LLM planner returns invalid JSON
+
+```bash
+# Check API key is set
+echo $ANTHROPIC_API_KEY  # Should not be empty
+
+# Enable debug logging to see raw LLM output
+ros2 run autonomous_humanoid_pkg llm_planner_node \
+    --ros-args --log-level DEBUG
+
+# Monitor raw planner output
+ros2 topic echo /planner/current_plan
+```
+
+### Failure: Nav2 does not reach the goal
+
+```bash
+# Check costmap is populated
+ros2 topic echo /global_costmap/costmap --once
+
+# Check VSLAM is publishing odometry
+ros2 topic hz /visual_slam/tracking/odometry
+# Expected: ~30 Hz
+
+# Check Nav2 status
+ros2 action list
+# Expected: /navigate_to_pose listed
+
+# Visualise in RViz2
+# Add: Map, Global Path, Local Path, Robot Model, TF
+```
+
+### Failure: System crashes on startup
+
+```bash
+# Check build is clean
+cd ~/ros2_ws
+colcon build 2>&1 | grep -E "ERROR|error"
+
+# Check all Python imports succeed
+python3 -c "
+import rclpy
+import whisper
+from anthropic import Anthropic
+import sounddevice
+print('All imports OK')
+"
+
+# Start nodes individually to isolate the failing one
+ros2 run autonomous_humanoid_pkg text_to_speech_node &
+ros2 run autonomous_humanoid_pkg voice_command_node &
+ros2 run autonomous_humanoid_pkg command_router_node &
+# Watch which one produces errors
+```
+
+---
+
+## 4.8 System Monitoring Dashboard
+
+Use `rqt` and RViz2 to build a live monitoring view:
+
+```bash
+# Launch the full monitoring suite
+rqt &
+
+# In rqt, add these plugins:
+# Plugins → Topics → Topic Monitor
+#   → /voice/status
+#   → /planner/status
+#   → /planner/current_step
+#   → /vslam/alert
+#   → /cmd_vel
+
+# Plugins → Visualization → Plot
+#   → /visual_slam/tracking/odometry/pose/pose/position/x
+#   → /visual_slam/tracking/odometry/pose/pose/position/y
+#   (draws the robot's path in real-time)
+```
+
+### System Status Publisher
+
+A monitoring node that aggregates all component statuses into a single dashboard topic:
+
+```python
+# system_monitor_node.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+import json
+import time
+
+class SystemMonitorNode(Node):
+    """
+    Aggregates component statuses and publishes a unified system health report.
+    """
+
+    COMPONENTS = [
+        '/voice/status',
+        '/planner/status',
+        '/vslam/alert',
+        '/planner/current_step',
+    ]
+
+    def __init__(self):
+        super().__init__('system_monitor')
+
+        self.status = {
+            'voice':    'UNKNOWN',
+            'planner':  'UNKNOWN',
+            'vslam':    'UNKNOWN',
+            'nav2':     'UNKNOWN',
+            'uptime_s': 0.0,
+            'start_time': time.time(),
+        }
+
+        # Subscribe to each component status
+        self.create_subscription(
+            String, '/voice/status',
+            lambda m: self._update('voice', m.data), 10
+        )
+        self.create_subscription(
+            String, '/planner/status',
+            lambda m: self._update('planner', m.data), 10
+        )
+        self.create_subscription(
+            String, '/vslam/alert',
+            lambda m: self._update('vslam', m.data), 10
+        )
+
+        # Publish dashboard at 1 Hz
+        self.dashboard_pub = self.create_publisher(
+            String, '/system/dashboard', 10
+        )
+        self.create_timer(1.0, self.publish_dashboard)
+
+        self.get_logger().info('System monitor started.')
+
+    def _update(self, component: str, value: str):
+        self.status[component] = value
+
+    def publish_dashboard(self):
+        self.status['uptime_s'] = round(
+            time.time() - self.status['start_time'], 1
+        )
+        msg = String()
+        msg.data = json.dumps(self.status, indent=2)
+        self.dashboard_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SystemMonitorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 4.9 Extension Challenges
+
+Once the base system is working, extend it with these challenges ordered by difficulty:
+
+### Extension A: Personality and Expressions (Beginner)
+
+Add a **personality layer** that gives the robot a consistent character:
+
+```python
+# personality_node.py
+ROBOT_NAME = "Atlas"
+GREETINGS = [
+    f"Hello! I'm {ROBOT_NAME}, ready to help.",
+    f"Hi there! {ROBOT_NAME} at your service.",
+    f"Good to see you! What can I do for you?",
+]
+
+ACKNOWLEDGEMENTS = [
+    "Sure, I'll get right on that.",
+    "Consider it done!",
+    "On my way!",
+    "I'm on it.",
+]
+
+# The robot randomly selects from these on each interaction
+# Add idle behaviours: look around when not busy, approach when someone
+# enters the room (face detection trigger), wave when someone waves.
+```
+
+### Extension B: Multi-Room Mapping (Intermediate)
+
+Extend the named locations to support **dynamic discovery**:
+
+```python
+# The robot is told "there's a bottle on the kitchen counter"
+# It stores this as a dynamic object location:
+self.object_locations['bottle'] = {
+    'room': 'kitchen',
+    'position': (3.5, 2.2),
+    'confidence': 0.9,
+    'timestamp': time.time(),
+}
+
+# Later: "bring me the bottle" resolves to navigate_to kitchen + pick bottle
+```
+
+### Extension C: Manipulation with MoveIt 2 (Advanced)
+
+Replace the placeholder `pick_object` and `place_object` handlers with real MoveIt 2 motion planning:
+
+```python
+from moveit_msgs.action import MoveGroup
+from rclpy.action import ActionClient
+
+class ManipulationExecutor(Node):
+    def __init__(self):
+        super().__init__('manipulation_executor')
+        self.moveit_client = ActionClient(self, MoveGroup, '/move_action')
+
+    def pick_object(self, object_pose, approach='top'):
+        """
+        Full pick sequence:
+        1. Plan approach trajectory to pre-grasp pose (MoveIt)
+        2. Open gripper
+        3. Plan grasp trajectory (Cartesian move)
+        4. Close gripper
+        5. Plan lift trajectory (straight up)
+        """
+        # ... MoveIt 2 planning code ...
+        pass
+```
+
+### Extension D: Multi-User Voice (Advanced)
+
+Use **speaker diarisation** to track multiple users:
+
+```python
+# pip install pyannote.audio
+from pyannote.audio import Pipeline as DiarisationPipeline
+
+# Identify WHO is speaking before routing the command
+# → "User A says go to kitchen" vs "User B says stop"
+# → robot prioritises based on operator vs observer role
+```
+
+### Extension E: Continuous Learning (Research Level)
+
+Log every instruction, plan, and success/failure. Fine-tune the LLM prompt or a smaller model on this data to improve performance on your specific environment and users over time.
+
+---
+
+## 4.10 Project Deliverables and Assessment
+
+### Required Deliverables
+
+For a university course submission, your project should include:
+
+**1. Working System Demonstration (40%)**
+- Record a 5-minute video of the robot executing at least 5 different voice commands successfully
+- Include at least one recovery scenario (robot gets stuck, replans)
+- Include at least one navigation task and one manipulation task
+
+**2. Technical Report (40%)**
+
+The report should cover:
+- System architecture diagram (your version of the diagram in Section 4.1)
+- Design decisions and alternatives considered
+- Performance measurements:
+
+```
+Metric                        Target      Your Result
+──────────────────────────────────────────────────────
+Voice transcription latency    < 3s        ___s
+LLM planning latency           < 8s        ___s
+Navigation success rate        > 80%       ___%
+Task completion rate           > 60%       ___%
+End-to-end latency (cmd→move)  < 15s       ___s
+```
+
+- Three specific failures observed and their root causes
+- Limitations of your implementation
+
+**3. Code Repository (20%)**
+- Clean, documented Python code
+- All nodes have docstrings
+- README with exact setup and run instructions
+- At least 5 test cases in `test/`
+
+### Assessment Rubric
+
+| Category | Weight | Excellent | Satisfactory | Needs Work |
+|---|---|---|---|---|
+| Voice pipeline works | 15% | ≤2s latency, wake word | Works, no wake word | Requires manual injection |
+| LLM planning correct | 20% | Handles 5+ task types | Handles 3 task types | 1-2 task types only |
+| Nav2 navigation | 20% | Reliable, with recovery | Mostly reaches goals | Frequent failures |
+| Integration | 25% | Seamless end-to-end | Manual restarts needed | Parts don't connect |
+| Code quality | 10% | Documented, tested | Runs but messy | Cannot reproduce |
+| Report quality | 10% | Quantified, honest | Descriptive | Incomplete |
+
+---
+
+## 4.11 Module 4 and Textbook Summary
+
+You have completed the final module of this textbook. Let us review the arc of the entire course:
+
+### Module 1: The Robotic Nervous System (ROS 2)
+You learned the middleware that connects all robot software components — nodes, topics, services, and actions — and built your first AI-to-robot bridge, connecting a Python LLM agent to a robot executor via structured JSON commands.
+
+### Module 2: Simulation
+You discovered how to develop and test robot software safely in simulation before touching expensive hardware, using tools like Gazebo and PyBullet alongside the ROS 2 bridge.
+
+### Module 3: The AI-Robot Brain (NVIDIA Isaac)
+You mastered the production-grade toolchain: Isaac Sim's photorealistic rendering, Replicator's synthetic data generation, cuVSLAM's hardware-accelerated localisation, and Nav2's autonomous navigation stack — all deployed on Jetson Orin for real-world performance.
+
+### Module 4: Vision-Language-Action
+You studied VLA models from first principles (RT-2, OpenVLA, π0), built a complete speech-to-action pipeline with Whisper, implemented a cognitive planning system with Claude, and assembled everything into a working autonomous humanoid.
+
+### The Bigger Picture
+
+The system you built in this capstone is a simplified but structurally complete version of what commercial humanoid robot companies are building today. The key differences are:
+
+- **Scale**: commercial systems use larger models, more powerful hardware, and more training data
+- **Reliability**: commercial systems have much more extensive safety systems, testing, and validation
+- **Manipulation**: real dexterous manipulation requires years of additional engineering beyond Nav2
+
+But the **architecture** is the same. Voice → understanding → planning → navigation → manipulation → feedback. You now have the vocabulary, the tools, and the working code to continue building on this foundation.
+
+The robots of 2030 will be built by engineers who understand — at the code level — how language models, sensor fusion, path planning, and physical control integrate into a unified system. You are now one of those engineers.
+
+---
+
+## Review Questions
+
+1. The master launch file uses `TimerAction(period=5.0)` for the sensing layer and `TimerAction(period=10.0)` for the cognition layer. Why are these delays necessary? What failure mode would occur if all nodes were started simultaneously?
+
+2. During integration testing, you find that the LLM planner receives voice commands correctly but the Nav2 goal is never reached. Walk through the verification ladder (Section 4.6) and describe exactly which diagnostic commands you would run at each rung, and what output would confirm or eliminate each rung as the source of the failure.
+
+3. The assessment rubric weights "integration" at 25% — the highest single weight. Justify this weighting from a software engineering perspective. Why is the integration of existing components often harder than building them individually?
+
+4. Extension C requires replacing placeholder manipulation handlers with real MoveIt 2 calls. Write the precondition check that must pass before the `pick_object` action is sent to MoveIt 2, including: gripper state, object pose confidence threshold, reachability check against the robot's arm reach specification, and object weight estimation.
+
+5. You have built a system that converts voice commands to robot actions via an LLM. A safety engineer reviewing the system identifies two concerns: (a) the LLM could plan an action that is kinematically infeasible, and (b) the TTS node confirming the plan adds latency but also creates an opportunity for human intervention. For each concern, describe a concrete technical mitigation you would implement in the codebase.

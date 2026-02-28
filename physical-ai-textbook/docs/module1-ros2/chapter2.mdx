@@ -1,0 +1,732 @@
+---
+title: "Chapter 2: Nodes, Topics, and Services"
+sidebar_position: 2
+---
+
+# Chapter 2: Nodes, Topics, and Services
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Create a ROS 2 node in Python using the `rclpy` library
+- Implement a publisher that sends custom messages on a topic
+- Implement a subscriber that receives and processes messages
+- Understand Quality-of-Service (QoS) settings and when to use them
+- Build a service server and client for request/response communication
+- Use `ros2` command-line tools to introspect a live system
+
+---
+
+## 2.1 The Node: Your Building Block
+
+In ROS 2, every piece of application logic lives inside a **node**. A node is a process that:
+
+1. Has a unique name within the ROS 2 graph
+2. Can advertise publishers and create subscribers
+3. Can create service servers and clients
+4. Can declare and read parameters
+5. Has its own logger (for structured console output)
+
+The smallest possible ROS 2 Python program is:
+
+```python
+import rclpy
+from rclpy.node import Node
+
+def main():
+    rclpy.init()                        # Initialise the ROS 2 context
+    node = Node('my_first_node')        # Create a node with a name
+    node.get_logger().info('Hello, ROS 2!')
+    rclpy.spin(node)                    # Block, processing callbacks
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+### Understanding `rclpy.spin()`
+
+`rclpy.spin(node)` enters an **event loop**. It blocks the current thread and dispatches incoming messages to their registered callback functions. When you press `Ctrl+C`, it receives a `SIGINT` signal and the spin returns, allowing graceful shutdown.
+
+There are several spin variants:
+
+```python
+rclpy.spin(node)                 # Block indefinitely
+rclpy.spin_once(node)            # Process one callback and return
+rclpy.spin_until_future_complete(node, future)  # Block until an async result
+```
+
+### Object-Oriented Node Style
+
+For any real project, you should extend `Node` into your own class. This is the idiomatic pattern used throughout the ROS 2 ecosystem:
+
+```python
+import rclpy
+from rclpy.node import Node
+
+class MyRobotNode(Node):
+    def __init__(self):
+        super().__init__('my_robot_node')
+        self.get_logger().info('Node has started.')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MyRobotNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+The `args=None` parameter allows ROS 2 to parse command-line arguments passed to the node (such as remappings and parameter overrides).
+
+---
+
+## 2.2 Topics: Asynchronous Data Streams
+
+A **topic** is a named data channel. The communication model is **anonymous publish-subscribe**:
+
+- A **publisher** sends messages to a topic without knowing who is listening
+- A **subscriber** receives messages from a topic without knowing who sent them
+- Any number of publishers and subscribers can share a topic
+
+This decoupling is powerful: you can add a data-recording node that subscribes to `/camera/image_raw` without modifying the camera driver node at all.
+
+### Message Types
+
+Every topic has a fixed **message type**. ROS 2 ships with hundreds of standard message types in the `std_msgs`, `sensor_msgs`, `geometry_msgs`, and `nav_msgs` packages. You can also define custom message types (covered in Chapter 3).
+
+Common message types you will use frequently:
+
+| Message Type | Package | Contents |
+|---|---|---|
+| `String` | `std_msgs` | A single string field |
+| `Int32`, `Float64` | `std_msgs` | Single integer or float |
+| `Header` | `std_msgs` | Timestamp + frame ID |
+| `Image` | `sensor_msgs` | Camera frame (encoding, data) |
+| `LaserScan` | `sensor_msgs` | 2D lidar scan |
+| `Imu` | `sensor_msgs` | IMU (gyro + accelerometer + orientation) |
+| `Pose` | `geometry_msgs` | 3D position + orientation |
+| `Twist` | `geometry_msgs` | Linear + angular velocity |
+| `Odometry` | `nav_msgs` | Robot pose + velocity |
+
+---
+
+## 2.3 Writing a Publisher
+
+The following publisher simulates a temperature sensor, publishing a `Float64` reading every second.
+
+```python
+# temperature_publisher.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64
+import random
+
+class TemperatureSensor(Node):
+    """
+    Simulates a temperature sensor that publishes
+    readings on the /temperature topic.
+    """
+    def __init__(self):
+        super().__init__('temperature_sensor')
+
+        # Create a publisher
+        # Arguments: message type, topic name, QoS queue depth
+        self.publisher_ = self.create_publisher(
+            Float64,          # Message type
+            '/temperature',   # Topic name
+            10                # QoS history depth (keep last 10 messages)
+        )
+
+        # Create a timer that fires every 1.0 seconds
+        timer_period = 1.0  # seconds
+        self.timer = self.create_timer(timer_period, self.publish_temperature)
+
+        self.get_logger().info('Temperature sensor node started.')
+
+    def publish_temperature(self):
+        """Callback: called every timer_period seconds."""
+        msg = Float64()
+        # Simulate a temperature between 36.0 and 40.0 degrees Celsius
+        msg.data = 36.0 + random.uniform(0.0, 4.0)
+
+        self.publisher_.publish(msg)
+        self.get_logger().info(f'Publishing temperature: {msg.data:.2f}°C')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TemperatureSensor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+### Key Points
+
+- `create_publisher(MsgType, topic, qos_depth)` registers the publisher with the ROS 2 graph. The topic is created automatically.
+- `create_timer(period_seconds, callback)` registers a timer callback. ROS 2 will call `publish_temperature` every second.
+- `publisher_.publish(msg)` serialises the message and sends it over DDS.
+
+---
+
+## 2.4 Writing a Subscriber
+
+Now let's write a node that subscribes to the `/temperature` topic and triggers an alert when the value is dangerously high.
+
+```python
+# temperature_monitor.py
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64
+
+FEVER_THRESHOLD = 38.5  # degrees Celsius
+
+class TemperatureMonitor(Node):
+    """
+    Monitors temperature readings and logs alerts
+    when the temperature exceeds the fever threshold.
+    """
+    def __init__(self):
+        super().__init__('temperature_monitor')
+
+        # Create a subscription
+        # Arguments: message type, topic name, callback, QoS depth
+        self.subscription = self.create_subscription(
+            Float64,
+            '/temperature',
+            self.temperature_callback,  # Called each time a message arrives
+            10
+        )
+
+        self.get_logger().info(
+            f'Monitor started. Alert threshold: {FEVER_THRESHOLD}°C'
+        )
+
+    def temperature_callback(self, msg: Float64):
+        """
+        This method is called automatically by rclpy
+        whenever a new message arrives on /temperature.
+        """
+        temp = msg.data
+
+        if temp > FEVER_THRESHOLD:
+            self.get_logger().warn(
+                f'HIGH TEMPERATURE ALERT: {temp:.2f}°C '
+                f'(threshold: {FEVER_THRESHOLD}°C)'
+            )
+        else:
+            self.get_logger().info(f'Temperature normal: {temp:.2f}°C')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TemperatureMonitor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+### Running Both Nodes
+
+Open three terminals:
+
+```bash
+# Terminal 1: Run the publisher
+python3 temperature_publisher.py
+
+# Terminal 2: Run the subscriber
+python3 temperature_monitor.py
+
+# Terminal 3: Inspect the live topic
+ros2 topic echo /temperature
+ros2 topic hz /temperature    # Measures the publishing rate
+ros2 topic info /temperature  # Shows type, publishers, subscribers
+```
+
+---
+
+## 2.5 Quality of Service (QoS) Policies
+
+The default QoS depth of `10` is a shorthand for a **QoS profile**. For more control, use `rclpy.qos.QoSProfile`:
+
+```python
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+
+# "Reliable sensor" profile: every message must be delivered
+reliable_qos = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+# "Best effort" profile: for high-frequency data where dropped frames are OK
+best_effort_qos = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+)
+
+self.publisher_ = self.create_publisher(Float64, '/temperature', reliable_qos)
+```
+
+### QoS Compatibility Rules
+
+**Important**: the publisher and subscriber QoS policies must be compatible, or the connection will silently fail. The rule is:
+
+| Publisher | Subscriber | Result |
+|---|---|---|
+| RELIABLE | RELIABLE | ✅ Connected |
+| RELIABLE | BEST_EFFORT | ✅ Connected |
+| BEST_EFFORT | RELIABLE | ❌ Incompatible |
+| BEST_EFFORT | BEST_EFFORT | ✅ Connected |
+
+You can diagnose QoS mismatches with:
+
+```bash
+ros2 topic info /temperature --verbose
+```
+
+### Pre-defined QoS Profiles
+
+ROS 2 ships with sensible built-in profiles for common use cases:
+
+```python
+from rclpy.qos import qos_profile_sensor_data        # Best-effort, keep last 5
+from rclpy.qos import qos_profile_system_default     # Reliable, keep last 10
+from rclpy.qos import qos_profile_services_default   # For services
+```
+
+---
+
+## 2.6 Working with Geometry Messages
+
+In robotics, the most commonly published data is geometric: positions, orientations, and velocities. Let's write a robot velocity controller that publishes `Twist` messages — the standard way to command a robot's motion.
+
+```python
+# robot_driver.py
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+import math
+
+class RobotDriver(Node):
+    """
+    Commands a differential-drive robot to drive in a square.
+    Publishes Twist messages to /cmd_vel.
+    """
+    def __init__(self):
+        super().__init__('robot_driver')
+
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # State machine: 0 = drive forward, 1 = turn
+        self.phase = 0
+        self.phase_count = 0
+
+        # Timer at 10 Hz
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+        self.get_logger().info('Robot driver node started.')
+
+    def control_loop(self):
+        msg = Twist()  # All fields default to 0.0
+
+        if self.phase == 0:
+            # Drive forward at 0.3 m/s for 3 seconds (30 ticks × 0.1s)
+            msg.linear.x = 0.3
+            msg.angular.z = 0.0
+            self.phase_count += 1
+            if self.phase_count >= 30:
+                self.phase = 1
+                self.phase_count = 0
+                self.get_logger().info('Switching to turning phase.')
+        else:
+            # Turn left at π/4 rad/s for 2 seconds (20 ticks × 0.1s)
+            msg.linear.x = 0.0
+            msg.angular.z = math.pi / 4
+            self.phase_count += 1
+            if self.phase_count >= 20:
+                self.phase = 0
+                self.phase_count = 0
+                self.get_logger().info('Switching to driving phase.')
+
+        self.publisher_.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RobotDriver()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        # On shutdown, publish zero velocity to stop the robot
+        stop_msg = Twist()
+        node.publisher_.publish(stop_msg)
+        node.get_logger().info('Stopping robot.')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+The `Twist` message encodes motion as:
+- `linear.x` — forward velocity (m/s)
+- `linear.y` — lateral velocity (m/s, for holonomic robots)
+- `angular.z` — rotation rate (rad/s, positive = counter-clockwise)
+
+---
+
+## 2.7 Services: Synchronous Request/Response
+
+Topics are fire-and-forget: the publisher does not know if anyone received the message. Services provide a **confirmed, synchronous** call-and-response pattern, like calling a function on a remote node.
+
+### The Service Definition
+
+Services are defined with a request and response pair, separated by `---`:
+
+```
+# AddTwoInts.srv
+int64 a
+int64 b
+---
+int64 sum
+```
+
+For built-in services, `example_interfaces/srv/AddTwoInts` is the classic example.
+
+### The Service Server
+
+```python
+# add_two_ints_server.py
+import rclpy
+from rclpy.node import Node
+from example_interfaces.srv import AddTwoInts
+
+class AddTwoIntsServer(Node):
+    def __init__(self):
+        super().__init__('add_two_ints_server')
+
+        # Create a service server
+        self.srv = self.create_service(
+            AddTwoInts,              # Service type
+            'add_two_ints',          # Service name
+            self.handle_add_request  # Callback
+        )
+
+        self.get_logger().info('AddTwoInts service server ready.')
+
+    def handle_add_request(self, request, response):
+        """
+        Called when a client sends a request.
+        Must populate and return the response object.
+        """
+        response.sum = request.a + request.b
+        self.get_logger().info(
+            f'Received: {request.a} + {request.b} = {response.sum}'
+        )
+        return response
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AddTwoIntsServer()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+### The Service Client
+
+```python
+# add_two_ints_client.py
+import sys
+import rclpy
+from rclpy.node import Node
+from example_interfaces.srv import AddTwoInts
+
+class AddTwoIntsClient(Node):
+    def __init__(self):
+        super().__init__('add_two_ints_client')
+        self.client = self.create_client(AddTwoInts, 'add_two_ints')
+
+    def call_service(self, a: int, b: int) -> int:
+        # Wait until the server is available
+        while not self.client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Waiting for service...')
+
+        # Build the request
+        request = AddTwoInts.Request()
+        request.a = a
+        request.b = b
+
+        # Send asynchronously and spin until done
+        future = self.client.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+
+        result = future.result()
+        self.get_logger().info(
+            f'Result: {a} + {b} = {result.sum}'
+        )
+        return result.sum
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    client_node = AddTwoIntsClient()
+
+    a = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    b = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+
+    result = client_node.call_service(a, b)
+    print(f'Sum: {result}')
+
+    client_node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+Run the server and client:
+
+```bash
+# Terminal 1
+python3 add_two_ints_server.py
+
+# Terminal 2
+python3 add_two_ints_client.py 42 58
+
+# Or call directly from CLI (no client code needed!)
+ros2 service call /add_two_ints example_interfaces/srv/AddTwoInts "{a: 42, b: 58}"
+```
+
+---
+
+## 2.8 A Practical Example: Sensor Fusion Node
+
+Let's bring topics and services together in a realistic scenario: a node that subscribes to both a lidar scan and an IMU, fuses them, and exposes a service to report current position confidence.
+
+```python
+# sensor_fusion_node.py
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan, Imu
+from std_srvs.srv import Trigger
+import math
+
+class SensorFusionNode(Node):
+    """
+    A simplified sensor fusion node that:
+    - Subscribes to /scan (lidar) and /imu/data
+    - Maintains a confidence estimate
+    - Exposes /get_confidence service
+    """
+
+    def __init__(self):
+        super().__init__('sensor_fusion')
+
+        # Track last received data
+        self.last_scan = None
+        self.last_imu = None
+        self.confidence = 0.0
+
+        # Subscribers
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, 10
+        )
+        self.imu_sub = self.create_subscription(
+            Imu, '/imu/data', self.imu_callback, 10
+        )
+
+        # Service server: returns confidence as a string
+        self.confidence_srv = self.create_service(
+            Trigger,
+            '/get_confidence',
+            self.confidence_callback
+        )
+
+        self.get_logger().info('Sensor fusion node started.')
+
+    def scan_callback(self, msg: LaserScan):
+        self.last_scan = msg
+        self._update_confidence()
+
+    def imu_callback(self, msg: Imu):
+        self.last_imu = msg
+        self._update_confidence()
+
+    def _update_confidence(self):
+        """
+        Simplified confidence: high if we have recent data from both sensors.
+        A real implementation would use Kalman filtering.
+        """
+        has_scan = self.last_scan is not None
+        has_imu = self.last_imu is not None
+        self.confidence = 1.0 if (has_scan and has_imu) else 0.5
+
+    def confidence_callback(self, request, response):
+        response.success = self.confidence > 0.8
+        response.message = (
+            f'Confidence: {self.confidence:.2f}. '
+            f'Scan: {"OK" if self.last_scan else "Missing"}. '
+            f'IMU: {"OK" if self.last_imu else "Missing"}.'
+        )
+        return response
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SensorFusionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 2.9 Parameters: Runtime Configuration
+
+Parameters allow you to expose tunable values without recompiling. The pattern is:
+
+```python
+class ConfigurableNode(Node):
+    def __init__(self):
+        super().__init__('configurable_node')
+
+        # Declare parameters with default values
+        self.declare_parameter('max_speed', 1.0)         # float
+        self.declare_parameter('robot_name', 'robot_1')  # string
+        self.declare_parameter('sensor_ids', [1, 2, 3])  # int array
+
+        # Read parameters
+        self.max_speed = self.get_parameter('max_speed').value
+        self.robot_name = self.get_parameter('robot_name').value
+
+        self.get_logger().info(
+            f'Robot "{self.robot_name}" max speed: {self.max_speed} m/s'
+        )
+```
+
+Override parameters at launch time:
+
+```bash
+python3 my_node.py --ros-args -p max_speed:=2.5 -p robot_name:=atlas
+```
+
+Or query/set them live:
+
+```bash
+ros2 param list /configurable_node
+ros2 param get /configurable_node max_speed
+ros2 param set /configurable_node max_speed 0.5
+```
+
+---
+
+## 2.10 Introspecting the Computation Graph
+
+One of ROS 2's greatest strengths is its **live introspection**. You can inspect any running system without modifying the code.
+
+```bash
+# See all nodes
+ros2 node list
+
+# See all topics with their message types
+ros2 topic list -t
+
+# Subscribe to a topic from the command line
+ros2 topic echo /temperature
+
+# Measure message frequency
+ros2 topic hz /camera/image_raw
+
+# See all information about a node (pubs, subs, services)
+ros2 node info /sensor_fusion
+
+# See all services
+ros2 service list
+
+# Call a service manually
+ros2 service call /get_confidence std_srvs/srv/Trigger {}
+
+# Record all messages to a bag file
+ros2 bag record -a -o my_recording
+
+# Play back a bag file
+ros2 bag play my_recording
+```
+
+The `ros2 bag` tool is invaluable for debugging: you can record a real robot session and replay it offline to develop and test algorithms without the physical hardware.
+
+---
+
+## 2.11 Chapter Summary
+
+This chapter transformed the conceptual understanding from Chapter 1 into working Python code:
+
+1. **Nodes** are the basic computational unit. Use the class-based pattern (`class MyNode(Node)`) for all real projects.
+
+2. **Publishers** send typed messages to named topics. Subscribers receive them. The many-to-many, anonymous nature enables loose coupling between components.
+
+3. **QoS policies** control reliability and latency. Match them between publishers and subscribers to avoid silent disconnections.
+
+4. **Services** provide synchronous request/response communication. Use them for infrequent, blocking operations. Prefer topics for streaming data.
+
+5. **Parameters** externalise configuration. Declare them with `declare_parameter()` and override them at launch time.
+
+6. The **ros2 CLI tools** (`topic echo`, `node info`, `service call`, `bag record`) are essential for debugging and understanding a live system.
+
+---
+
+## Review Questions
+
+1. What is the difference between a publisher and a subscriber? Give a real-world robotics example for each.
+
+2. Explain why QoS compatibility matters. Write the Python code to create a `BEST_EFFORT`, keep-last-1 publisher for a camera image stream, and explain why you chose those settings.
+
+3. A junior developer proposes using a service call to stream a robot's joint positions to a controller at 100 Hz. What is wrong with this approach? What should they use instead?
+
+4. Modify the `TemperatureMonitor` node to also publish a `Bool` message on a `/fever_alert` topic whenever the temperature exceeds the threshold. Include the complete modified class code.
+
+5. Using only `ros2` command-line tools (no code), how would you: (a) verify that the `sensor_fusion` node is running; (b) check what topics it subscribes to; (c) manually inject a message onto `/imu/data`?

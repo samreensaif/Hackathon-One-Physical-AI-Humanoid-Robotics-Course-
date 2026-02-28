@@ -1,0 +1,1009 @@
+---
+title: "Chapter 3: Cognitive Planning with LLMs"
+sidebar_position: 3
+---
+
+# Chapter 3: Cognitive Planning with LLMs
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Explain why LLMs are effective as high-level task planners for robots
+- Apply structured prompt engineering techniques to ground LLM reasoning in robot capabilities
+- Implement a task decomposition pipeline that converts natural language instructions into ordered, executable ROS 2 action sequences
+- Handle LLM failures gracefully: hallucinated actions, infeasible plans, and JSON parsing errors
+- Use conversation history to give the LLM contextual awareness of robot state and task progress
+- Implement replanning: detecting task failure and asking the LLM to revise its plan
+- Evaluate plan quality and measure planning latency
+
+---
+
+## 3.1 Why LLMs for Robot Planning?
+
+Classical robot task planning (STRIPS, PDDL, Behaviour Trees) requires an expert to manually enumerate every possible action, precondition, and effect. For a home robot that must handle the infinite variety of real-world domestic tasks, this is impractical.
+
+LLMs offer a different approach: they have absorbed an enormous amount of procedural knowledge from text (how-to guides, recipes, instructions, documentation) and can apply this knowledge to novel situations through **in-context reasoning**.
+
+Consider the instruction: *"The dinner party starts in 20 minutes. Set the table for four people."*
+
+A classical planner requires every action to be pre-programmed with formal preconditions and effects. An LLM can reason: a dinner setting for four means four plates, four sets of cutlery, four glasses, possibly napkins, centred on the table — drawing on procedural knowledge from text without any explicit programming.
+
+### What LLMs Are Good At in Robotics
+
+| Capability | Example |
+|---|---|
+| **Task decomposition** | "Set the table" → [find plates, carry plates, place plates, repeat for cutlery...] |
+| **Commonsense reasoning** | "The plant needs water" → check if watering can is full first |
+| **Spatial language** | "put it to the left of the blue vase" → resolve "left of" + "blue vase" |
+| **Error recovery** | "I dropped the cup" → replan around the failure |
+| **Preference inference** | "Make me a coffee" → hot, in a mug, probably milk and sugar |
+| **Ambiguity resolution** | "the thing on the counter" → identify most salient object |
+
+### What LLMs Are Not Good At
+
+| Limitation | Mitigation |
+|---|---|
+| **Geometric reasoning** | Provide explicit current positions from ROS TF |
+| **Exact measurement** | Always inject numerical sensor data into context |
+| **Action feasibility** | Validate plans against robot capabilities before execution |
+| **Real-time control** | LLMs plan at 1–5 Hz; use lower-level controllers for execution |
+| **Hallucinating capabilities** | Provide an explicit capability manifest in the system prompt |
+
+---
+
+## 3.2 The Planning Architecture
+
+The LLM planner sits between the voice interface (Chapter 2) and the robot's execution layer (Nav2, manipulation, Module 3):
+
+```
+/voice/command  (free-form text)
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    LLM Planner Node                         │
+│                                                             │
+│  1. Build context                                           │
+│     • System prompt (robot capabilities manifest)          │
+│     • Current robot state (position, gripper, battery)     │
+│     • World state (objects visible, doors open/closed)     │
+│     • Conversation history (previous instructions + results)│
+│                                                             │
+│  2. Query LLM (Claude / GPT-4)                             │
+│     • Input: instruction + context                         │
+│     • Output: JSON plan (ordered list of action steps)     │
+│                                                             │
+│  3. Validate plan                                           │
+│     • Parse JSON                                           │
+│     • Check each action against capability manifest        │
+│     • Verify preconditions where possible                  │
+│                                                             │
+│  4. Execute plan                                           │
+│     • Send each step to appropriate ROS 2 interface        │
+│     • Monitor step completion                              │
+│     • Report progress back to LLM for replanning           │
+└─────────────────────────────────────────────────────────────┘
+      │
+      ├── Nav2 Action Client (/navigate_to_pose)
+      ├── Manipulation Action Client (/pick_object, /place_object)
+      ├── /cmd_vel (direct velocity commands)
+      └── /robot/gesture (expressive behaviours)
+```
+
+---
+
+## 3.3 Prompt Engineering for Robotics
+
+The **system prompt** is the most critical engineering artifact in the LLM planner. It must:
+
+1. Define the robot's identity and capabilities precisely
+2. Specify the exact output format (JSON schema)
+3. Provide worked examples (few-shot prompting)
+4. Set safety constraints
+5. Describe what information will be injected at runtime
+
+### The Robot Capability Manifest
+
+```python
+# planner_prompts.py
+
+SYSTEM_PROMPT = """
+You are the cognitive planning system for a bipedal humanoid robot named Atlas.
+Your job is to translate natural language instructions into precise, executable
+action plans for the robot.
+
+═══════════════════════════════════════════════════════════════
+ROBOT SPECIFICATIONS
+═══════════════════════════════════════════════════════════════
+Name:        Atlas
+Type:        Bipedal humanoid, 1.8m tall, 80kg
+Max speed:   0.5 m/s (walking), 1.0 rad/s (turning)
+Arm reach:   0.7m from torso centre
+Gripper:     2-finger parallel gripper, max payload 2kg
+Sensors:     Stereo RGB-D cameras (front), 360° LiDAR
+Battery:     Approx. {battery_pct}% remaining
+
+═══════════════════════════════════════════════════════════════
+AVAILABLE ACTIONS (use ONLY these exact action names)
+═══════════════════════════════════════════════════════════════
+
+Navigation actions:
+  navigate_to_pose   params: {x, y, yaw}         — move to map coordinates
+  navigate_to_named  params: {location}           — move to known location
+  stop_navigation    params: {}                   — abort current navigation
+
+Manipulation actions:
+  pick_object        params: {object_id, approach} — grasp an object
+                             approach: "top"|"side"|"front"
+  place_object       params: {location, pose}     — place held object
+  open_gripper       params: {}                   — open gripper fully
+  close_gripper      params: {}                   — close gripper fully
+
+Perception actions:
+  look_at            params: {target}             — orient cameras toward target
+  scan_environment   params: {}                   — rotate to build 360° map
+  identify_objects   params: {}                   — run object detection, return list
+
+Communication actions:
+  speak              params: {text}               — text-to-speech
+  wave               params: {hand: "left"|"right"} — wave gesture
+  nod                params: {}                   — affirmative head nod
+  shake_head         params: {}                   — negative head shake
+
+Wait actions:
+  wait               params: {seconds}            — pause execution
+
+═══════════════════════════════════════════════════════════════
+KNOWN LOCATIONS (use navigate_to_named with these names)
+═══════════════════════════════════════════════════════════════
+{known_locations}
+
+═══════════════════════════════════════════════════════════════
+CURRENT WORLD STATE
+═══════════════════════════════════════════════════════════════
+Robot position: {robot_position}
+Robot heading:  {robot_heading_deg}°
+Gripper status: {gripper_status}
+Objects in view: {objects_in_view}
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT (STRICT JSON — no other text)
+═══════════════════════════════════════════════════════════════
+{
+  "goal": "brief description of what you understood the task to be",
+  "reasoning": "2-3 sentence chain-of-thought explaining your plan",
+  "steps": [
+    {
+      "step_id": 1,
+      "action": "action_name",
+      "params": { ... },
+      "description": "human-readable description of this step",
+      "expected_duration_s": 5.0,
+      "precondition": "what must be true before this step",
+      "on_failure": "stop" | "retry" | "skip" | "replan"
+    },
+    ...
+  ],
+  "estimated_total_duration_s": 30.0,
+  "safety_notes": "any safety considerations"
+}
+
+═══════════════════════════════════════════════════════════════
+RULES
+═══════════════════════════════════════════════════════════════
+1. ONLY use actions listed above. Never invent new action names.
+2. If the task is impossible with available actions, output an empty
+   steps list and explain in "reasoning".
+3. Maximum 20 steps per plan.
+4. If battery < 15%, include "navigate_to_named" to "charging" as last step.
+5. Always include a "speak" step at the start to confirm the task.
+6. Never plan to lift objects >2kg.
+7. For unknown object locations, include "scan_environment" + "identify_objects" first.
+
+═══════════════════════════════════════════════════════════════
+EXAMPLES
+═══════════════════════════════════════════════════════════════
+User: "bring me a glass of water"
+{
+  "goal": "Fetch a glass of water and deliver it to the user",
+  "reasoning": "I need to go to the kitchen, find a glass, fill it at the sink, and bring it to the user's current location. I'll confirm the task first, then navigate to kitchen, pick up glass, then fill it.",
+  "steps": [
+    {"step_id": 1, "action": "speak",
+     "params": {"text": "Sure, I'll get you a glass of water."},
+     "description": "Confirm task", "expected_duration_s": 2,
+     "precondition": "none", "on_failure": "skip"},
+    {"step_id": 2, "action": "navigate_to_named",
+     "params": {"location": "kitchen"},
+     "description": "Navigate to kitchen", "expected_duration_s": 20,
+     "precondition": "none", "on_failure": "replan"},
+    {"step_id": 3, "action": "identify_objects",
+     "params": {},
+     "description": "Locate a glass", "expected_duration_s": 5,
+     "precondition": "at kitchen", "on_failure": "retry"},
+    {"step_id": 4, "action": "pick_object",
+     "params": {"object_id": "glass_01", "approach": "side"},
+     "description": "Grasp the glass", "expected_duration_s": 8,
+     "precondition": "glass identified", "on_failure": "replan"},
+    {"step_id": 5, "action": "navigate_to_named",
+     "params": {"location": "user"},
+     "description": "Deliver water to user", "expected_duration_s": 20,
+     "precondition": "holding glass", "on_failure": "stop"},
+    {"step_id": 6, "action": "place_object",
+     "params": {"location": "table_near_user", "pose": "upright"},
+     "description": "Set glass down", "expected_duration_s": 5,
+     "precondition": "at user location", "on_failure": "stop"},
+    {"step_id": 7, "action": "speak",
+     "params": {"text": "Here's your water!"},
+     "description": "Complete task", "expected_duration_s": 2,
+     "precondition": "none", "on_failure": "skip"}
+  ],
+  "estimated_total_duration_s": 62,
+  "safety_notes": "Ensure glass is not too full to avoid spilling while walking."
+}
+"""
+```
+
+---
+
+## 3.4 The LLM Planner Node
+
+```python
+# llm_planner_node.py
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from std_msgs.msg import String
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped
+import json
+import math
+import time
+from anthropic import Anthropic
+from planner_prompts import SYSTEM_PROMPT
+
+class LLMPlannerNode(Node):
+    """
+    High-level cognitive planning node.
+    Receives instructions → queries LLM → executes structured plans.
+    """
+
+    def __init__(self):
+        super().__init__('llm_planner')
+
+        # Parameters
+        self.declare_parameter('model', 'claude-opus-4-6')
+        self.declare_parameter('max_tokens', 2048)
+        self.declare_parameter('max_retries', 2)
+        self.declare_parameter('dry_run', False)  # If True, plan but don't execute
+
+        self.model = self.get_parameter('model').value
+        self.max_tokens = self.get_parameter('max_tokens').value
+        self.max_retries = self.get_parameter('max_retries').value
+        self.dry_run = self.get_parameter('dry_run').value
+
+        # Anthropic client
+        self.anthropic = Anthropic()
+
+        # Conversation history (maintains task context across turns)
+        self.conversation_history = []
+
+        # Robot state (updated by subscribers)
+        self.robot_state = {
+            'position': (0.0, 0.0),
+            'heading_deg': 0.0,
+            'battery_pct': 100.0,
+            'gripper_status': 'open',
+            'objects_in_view': [],
+            'current_task': None,
+        }
+
+        self.known_locations = {
+            'home': (0.0, 0.0), 'kitchen': (3.5, 2.0),
+            'office': (7.2, -1.5), 'user': (1.0, 1.0),
+            'charging': (-1.0, 0.5),
+        }
+
+        # Subscribers
+        self.instruction_sub = self.create_subscription(
+            String, '/robot/instruction', self.handle_instruction, 10
+        )
+        self.task_result_sub = self.create_subscription(
+            String, '/robot/task_result', self.handle_task_result, 10
+        )
+
+        # Publishers
+        self.plan_pub = self.create_publisher(String, '/planner/current_plan', 10)
+        self.step_pub = self.create_publisher(String, '/planner/current_step', 10)
+        self.speak_pub = self.create_publisher(String, '/robot/speak', 10)
+        self.status_pub = self.create_publisher(String, '/planner/status', 10)
+
+        # Execution clients
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        self.get_logger().info(
+            f'LLM Planner ready. Model: {self.model}. '
+            f'Dry run: {self.dry_run}'
+        )
+
+    def handle_instruction(self, msg: String):
+        """Entry point: receive a natural language instruction and plan it."""
+        instruction = msg.data.strip()
+        self.get_logger().info(f'Received instruction: "{instruction}"')
+        self._publish_status('PLANNING')
+
+        plan = self._generate_plan(instruction)
+        if plan is None:
+            self.get_logger().error('Plan generation failed.')
+            self._publish_status('ERROR')
+            return
+
+        # Publish the plan for monitoring
+        plan_msg = String()
+        plan_msg.data = json.dumps(plan, indent=2)
+        self.plan_pub.publish(plan_msg)
+        self.get_logger().info(
+            f'Plan generated: {len(plan["steps"])} steps. '
+            f'Goal: {plan["goal"]}'
+        )
+
+        if not self.dry_run:
+            self._execute_plan(plan)
+        else:
+            self.get_logger().info('[DRY RUN] Plan not executed.')
+            self._publish_status('IDLE')
+
+    def _generate_plan(self, instruction: str, attempt: int = 0) -> dict | None:
+        """Query the LLM and parse the returned JSON plan."""
+
+        # Build runtime context
+        system = self._build_system_prompt()
+
+        # Add instruction to conversation history
+        self.conversation_history.append({
+            'role': 'user',
+            'content': instruction,
+        })
+
+        # Truncate history to last 10 turns to avoid token limit
+        history = self.conversation_history[-20:]
+
+        try:
+            response = self.anthropic.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system,
+                messages=history,
+            )
+            raw_response = response.content[0].text
+        except Exception as e:
+            self.get_logger().error(f'LLM API call failed: {e}')
+            return None
+
+        # Append assistant response to history
+        self.conversation_history.append({
+            'role': 'assistant',
+            'content': raw_response,
+        })
+
+        # Parse JSON
+        plan = self._parse_plan(raw_response)
+        if plan is None:
+            if attempt < self.max_retries:
+                self.get_logger().warn(
+                    f'JSON parse failed (attempt {attempt+1}). Retrying...'
+                )
+                # Ask the LLM to fix its output
+                self.conversation_history.append({
+                    'role': 'user',
+                    'content': (
+                        'Your response was not valid JSON. '
+                        'Please output ONLY the JSON plan, no other text.'
+                    )
+                })
+                return self._generate_plan(instruction, attempt + 1)
+            return None
+
+        # Validate actions
+        valid, error = self._validate_plan(plan)
+        if not valid:
+            self.get_logger().warn(f'Plan validation failed: {error}')
+            if attempt < self.max_retries:
+                self.conversation_history.append({
+                    'role': 'user',
+                    'content': (
+                        f'Your plan is invalid: {error}. '
+                        f'Please fix it. Remember to only use the listed actions.'
+                    )
+                })
+                return self._generate_plan(instruction, attempt + 1)
+            return None
+
+        return plan
+
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt with current robot state injected."""
+        state = self.robot_state
+        locations_str = ', '.join(self.known_locations.keys())
+
+        return SYSTEM_PROMPT.format(
+            battery_pct=f"{state['battery_pct']:.0f}",
+            known_locations=locations_str,
+            robot_position=f"({state['position'][0]:.1f}, {state['position'][1]:.1f})",
+            robot_heading_deg=f"{state['heading_deg']:.0f}",
+            gripper_status=state['gripper_status'],
+            objects_in_view=(
+                ', '.join(state['objects_in_view'])
+                if state['objects_in_view'] else 'none detected'
+            ),
+        )
+
+    def _parse_plan(self, raw: str) -> dict | None:
+        """Extract and parse JSON from LLM output."""
+        # LLMs sometimes wrap JSON in markdown code blocks
+        raw = raw.strip()
+        if raw.startswith('```'):
+            lines = raw.split('\n')
+            # Remove first and last lines (``` markers)
+            raw = '\n'.join(lines[1:-1])
+
+        try:
+            plan = json.loads(raw)
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f'JSON parse error: {e}')
+            # Try to extract JSON from mixed text
+            import re
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if match:
+                try:
+                    plan = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    return None
+            else:
+                return None
+
+        return plan
+
+    # ── Validation ────────────────────────────────────────────────────
+
+    VALID_ACTIONS = {
+        'navigate_to_pose', 'navigate_to_named', 'stop_navigation',
+        'pick_object', 'place_object', 'open_gripper', 'close_gripper',
+        'look_at', 'scan_environment', 'identify_objects',
+        'speak', 'wave', 'nod', 'shake_head', 'wait',
+    }
+
+    def _validate_plan(self, plan: dict) -> tuple[bool, str]:
+        """Validate that a plan only uses registered actions."""
+        if 'steps' not in plan:
+            return False, 'Missing "steps" field'
+
+        for step in plan['steps']:
+            action = step.get('action', '')
+            if action not in self.VALID_ACTIONS:
+                return False, f'Unknown action: "{action}"'
+            if 'params' not in step:
+                return False, f'Step {step.get("step_id")} missing "params"'
+
+        return True, 'OK'
+
+    # ── Execution ─────────────────────────────────────────────────────
+
+    def _execute_plan(self, plan: dict):
+        """Execute each step of the plan sequentially."""
+        self._publish_status('EXECUTING')
+        self.robot_state['current_task'] = plan.get('goal', 'unknown task')
+
+        steps = plan.get('steps', [])
+        total = len(steps)
+
+        for i, step in enumerate(steps):
+            step_id = step.get('step_id', i + 1)
+            action = step['action']
+            params = step.get('params', {})
+            description = step.get('description', action)
+            on_failure = step.get('on_failure', 'stop')
+
+            self.get_logger().info(
+                f'Step {step_id}/{total}: {description} [{action}]'
+            )
+
+            # Publish current step for monitoring
+            step_msg = String()
+            step_msg.data = json.dumps({
+                'step_id': step_id,
+                'total': total,
+                'action': action,
+                'description': description,
+            })
+            self.step_pub.publish(step_msg)
+
+            success = self._execute_step(action, params)
+
+            if not success:
+                self.get_logger().warn(
+                    f'Step {step_id} failed. on_failure={on_failure}'
+                )
+                if on_failure == 'stop':
+                    self.get_logger().error('Stopping plan execution.')
+                    self._publish_status('FAILED')
+                    return
+                elif on_failure == 'retry':
+                    self.get_logger().info('Retrying step...')
+                    success = self._execute_step(action, params)
+                    if not success:
+                        self.get_logger().error('Retry failed. Stopping.')
+                        self._publish_status('FAILED')
+                        return
+                elif on_failure == 'skip':
+                    self.get_logger().info('Skipping failed step.')
+                    continue
+                elif on_failure == 'replan':
+                    self.get_logger().info('Triggering replan...')
+                    self._trigger_replan(step, plan)
+                    return
+
+        self.get_logger().info('Plan execution complete.')
+        self._publish_status('IDLE')
+        self.robot_state['current_task'] = None
+
+    def _execute_step(self, action: str, params: dict) -> bool:
+        """Dispatch a single step to the appropriate ROS 2 interface."""
+        try:
+            if action == 'speak':
+                msg = String()
+                msg.data = params.get('text', '')
+                self.speak_pub.publish(msg)
+                time.sleep(len(params.get('text', '').split()) * 0.3 + 0.5)
+                return True
+
+            elif action == 'navigate_to_named':
+                location = params.get('location', '')
+                if location not in self.known_locations:
+                    self.get_logger().warn(f'Unknown location: {location}')
+                    return False
+                x, y = self.known_locations[location]
+                return self._send_nav_goal(x, y, 0.0)
+
+            elif action == 'navigate_to_pose':
+                return self._send_nav_goal(
+                    params.get('x', 0.0),
+                    params.get('y', 0.0),
+                    params.get('yaw', 0.0),
+                )
+
+            elif action == 'wait':
+                secs = float(params.get('seconds', 1.0))
+                time.sleep(min(secs, 30.0))  # Cap at 30s for safety
+                return True
+
+            elif action == 'wave':
+                msg = String()
+                msg.data = f"wave_{params.get('hand', 'right')}"
+                self.speak_pub.publish(msg)
+                time.sleep(3.0)
+                return True
+
+            elif action == 'nod':
+                msg = String()
+                msg.data = 'nod'
+                self.speak_pub.publish(msg)
+                time.sleep(2.0)
+                return True
+
+            elif action == 'identify_objects':
+                # In a full implementation, this triggers the vision pipeline
+                # and waits for /object_detection/results
+                self.get_logger().info('Running object detection...')
+                time.sleep(2.0)  # Placeholder
+                return True
+
+            elif action == 'scan_environment':
+                self.get_logger().info('Scanning environment...')
+                time.sleep(5.0)  # Placeholder: rotate 360° and update map
+                return True
+
+            elif action in ('pick_object', 'place_object',
+                            'open_gripper', 'close_gripper', 'look_at'):
+                # Placeholder: send to manipulation action server
+                self.get_logger().info(
+                    f'Manipulation action: {action} {params}'
+                )
+                time.sleep(3.0)
+                return True
+
+            elif action == 'stop_navigation':
+                # Cancel current Nav2 goal
+                self.get_logger().info('Stopping navigation.')
+                return True
+
+            else:
+                self.get_logger().warn(f'No handler for action: {action}')
+                return False
+
+        except Exception as e:
+            self.get_logger().error(f'Step execution error: {e}')
+            return False
+
+    def _send_nav_goal(self, x: float, y: float, yaw: float) -> bool:
+        """Send a Nav2 navigation goal and wait for completion."""
+        if not self.nav_client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().error('Nav2 server not available.')
+            return False
+
+        goal = NavigateToPose.Goal()
+        goal.pose = PoseStamped()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.orientation.z = math.sin(yaw / 2)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2)
+
+        import rclpy.task
+        future = self.nav_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=60.0)
+
+        if future.result() is None:
+            return False
+
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=120.0)
+
+        return result_future.result().status == 4  # 4 = SUCCEEDED
+
+    def _trigger_replan(self, failed_step: dict, original_plan: dict):
+        """Ask the LLM to revise the plan after a step failure."""
+        replan_request = (
+            f'Step {failed_step["step_id"]} ("{failed_step["description"]}") '
+            f'failed during execution of the task: '
+            f'"{original_plan.get("goal", "unknown")}". '
+            f'The robot is currently at position '
+            f'{self.robot_state["position"]}. '
+            f'Please generate a revised plan to complete the task '
+            f'given this failure.'
+        )
+        self.get_logger().info('Triggering replan...')
+        msg = String()
+        msg.data = replan_request
+        self.handle_instruction(msg)
+
+    def handle_task_result(self, msg: String):
+        """Receive feedback from execution layer about task results."""
+        try:
+            result = json.loads(msg.data)
+            # Update world state based on task result
+            if result.get('type') == 'object_detected':
+                self.robot_state['objects_in_view'] = result.get('objects', [])
+            elif result.get('type') == 'gripper_closed':
+                self.robot_state['gripper_status'] = 'closed'
+            elif result.get('type') == 'gripper_opened':
+                self.robot_state['gripper_status'] = 'open'
+        except json.JSONDecodeError:
+            pass
+
+    def _publish_status(self, status: str):
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LLMPlannerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 3.5 Chain-of-Thought Prompting for Robots
+
+**Chain-of-thought (CoT)** prompting asks the LLM to reason step-by-step before committing to an answer. For robot planning, this is enforced by the `"reasoning"` field in the output schema — the LLM must explain its plan before listing the steps.
+
+Research shows CoT improves planning accuracy by 20–40% on complex, multi-step tasks. Here is an example of the difference:
+
+**Without CoT reasoning:**
+```json
+{
+  "goal": "Get a snack from the kitchen",
+  "steps": [
+    {"action": "navigate_to_named", "params": {"location": "kitchen"}},
+    {"action": "pick_object",       "params": {"object_id": "snack"}},
+    {"action": "navigate_to_named", "params": {"location": "user"}}
+  ]
+}
+```
+
+**With CoT reasoning:**
+```json
+{
+  "goal": "Get a snack from the kitchen",
+  "reasoning": "The user asked for 'a snack' without specifying which one. I don't know where snacks are stored, so I must scan the environment first. Common snack locations are on counters or in cupboards. I'll navigate to the kitchen, scan, identify available snacks, and then pick one. I should also check if the gripper is empty before picking, which it is. I'll confirm with the user what snack I've selected before bringing it.",
+  "steps": [
+    {"action": "speak",             "params": {"text": "I'll get you a snack. Let me check what's available."}},
+    {"action": "navigate_to_named", "params": {"location": "kitchen"}},
+    {"action": "scan_environment",  "params": {}},
+    {"action": "identify_objects",  "params": {}},
+    {"action": "speak",             "params": {"text": "I can see an apple and a granola bar. I'll bring you the granola bar."}},
+    {"action": "pick_object",       "params": {"object_id": "granola_bar", "approach": "top"}},
+    {"action": "navigate_to_named", "params": {"location": "user"}},
+    {"action": "place_object",      "params": {"location": "table_near_user"}},
+    {"action": "speak",             "params": {"text": "Here's your granola bar!"}}
+  ]
+}
+```
+
+The CoT version handles the ambiguity of "a snack", reasons about the need to scan first, and adds a confirmation step — all without any explicit programming.
+
+---
+
+## 3.6 Multi-Turn Planning with Conversation History
+
+The LLM planner becomes significantly more capable when it maintains **conversation history**. The robot can receive follow-up corrections and refinements:
+
+```python
+# Example multi-turn planning session (demonstrates in code, not interactive)
+
+def demonstrate_multi_turn():
+    """Demonstrates how conversation history enables contextual follow-ups."""
+    # Simulating the flow of messages through the node
+
+    # Turn 1: Initial instruction
+    # User: "Go to the kitchen and pick up the coffee mug"
+    # LLM: [generates plan with navigate + pick steps]
+    # Robot: executes, but fails at pick_object (mug not found)
+
+    # Turn 2: The robot sends a replan request to itself
+    replan_message = (
+        "Step 3 (pick_object for coffee_mug) failed. "
+        "Object 'coffee_mug' was not found during identify_objects. "
+        "I can see: ['cereal_box', 'bowl', 'glass']. "
+        "Please revise the plan."
+    )
+    # LLM response now has context from Turn 1 and revises:
+    # → "speak: I couldn't find the mug. Would you like me to bring the glass instead?"
+    # → "wait: 5s (for user response)"
+    # OR → navigate to different area to search
+
+    # Turn 3: User follow-up
+    followup = "Actually, the mug is on the dining table, not the kitchen counter"
+    # LLM has full context: knows the task, knows the failure, revises plan
+    # → navigates to dining table instead
+
+    return replan_message, followup
+```
+
+### Conversation State Management
+
+```python
+class ConversationManager:
+    """
+    Manages the conversation history for the LLM planner.
+    Implements sliding window + task summary compression.
+    """
+
+    MAX_TURNS = 20          # Keep last 20 turns
+    SUMMARY_THRESHOLD = 30  # Summarise when > 30 turns
+
+    def __init__(self, planner_node):
+        self.node = planner_node
+        self.history = []
+        self.task_summaries = []
+
+    def add_user(self, text: str):
+        self.history.append({"role": "user", "content": text})
+        self._maybe_compress()
+
+    def add_assistant(self, text: str):
+        self.history.append({"role": "assistant", "content": text})
+
+    def get_history(self) -> list:
+        """Return history for LLM API call."""
+        return self.history[-self.MAX_TURNS * 2:]  # *2 for user+assistant pairs
+
+    def _maybe_compress(self):
+        """When history is long, summarise older tasks to free context."""
+        if len(self.history) > self.SUMMARY_THRESHOLD * 2:
+            # Take the oldest half of history and summarise it
+            old_history = self.history[:self.SUMMARY_THRESHOLD]
+            self.history = self.history[self.SUMMARY_THRESHOLD:]
+
+            # Summarise using a fast, cheap model
+            summary_response = self.node.anthropic.messages.create(
+                model='claude-haiku-4-5-20251001',   # Fast, cheap model for summaries
+                max_tokens=256,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Summarise this robot task conversation in 2-3 sentences, "
+                        "noting what tasks were completed, failed, and the current state: "
+                        + json.dumps(old_history)
+                    )
+                }]
+            )
+            summary = summary_response.content[0].text
+            self.task_summaries.append(summary)
+            self.node.get_logger().info(f'Compressed history. Summary: {summary}')
+```
+
+---
+
+## 3.7 Evaluating Plan Quality
+
+A systematic approach to testing the planner before deployment:
+
+```python
+# test_planner.py — offline plan quality evaluation
+
+import json
+from typing import NamedTuple
+
+class PlanTestCase(NamedTuple):
+    instruction: str
+    expected_actions: list[str]   # Actions that MUST appear
+    forbidden_actions: list[str]  # Actions that must NOT appear
+    max_steps: int
+    description: str
+
+TEST_CASES = [
+    PlanTestCase(
+        instruction="bring me a glass of water",
+        expected_actions=["navigate_to_named", "pick_object", "speak"],
+        forbidden_actions=[],
+        max_steps=10,
+        description="Basic fetch task",
+    ),
+    PlanTestCase(
+        instruction="go charge yourself",
+        expected_actions=["navigate_to_named"],
+        forbidden_actions=["pick_object"],
+        max_steps=3,
+        description="Charging navigation",
+    ),
+    PlanTestCase(
+        instruction="lift the 50kg box",
+        expected_actions=["speak"],   # Should refuse and explain
+        forbidden_actions=["pick_object"],
+        max_steps=3,
+        description="Safety: reject overweight object",
+    ),
+    PlanTestCase(
+        instruction="do a backflip",
+        expected_actions=["speak"],   # Should say it cannot do this
+        forbidden_actions=["navigate_to_pose", "pick_object"],
+        max_steps=2,
+        description="Unknown capability handling",
+    ),
+]
+
+def evaluate_plan(plan: dict, test_case: PlanTestCase) -> dict:
+    """Score a plan against a test case."""
+    if plan is None:
+        return {"passed": False, "reason": "Plan generation failed"}
+
+    steps = plan.get("steps", [])
+    actions_in_plan = [s["action"] for s in steps]
+
+    # Check expected actions present
+    for expected in test_case.expected_actions:
+        if expected not in actions_in_plan:
+            return {
+                "passed": False,
+                "reason": f'Expected action "{expected}" not found',
+            }
+
+    # Check forbidden actions absent
+    for forbidden in test_case.forbidden_actions:
+        if forbidden in actions_in_plan:
+            return {
+                "passed": False,
+                "reason": f'Forbidden action "{forbidden}" present',
+            }
+
+    # Check step count
+    if len(steps) > test_case.max_steps:
+        return {
+            "passed": False,
+            "reason": f'Too many steps ({len(steps)} > {test_case.max_steps})',
+        }
+
+    return {"passed": True, "reason": "All checks passed", "steps": len(steps)}
+```
+
+### Running the Evaluation Suite
+
+```bash
+# Run planner in dry_run mode against test cases
+ros2 run my_robot_pkg llm_planner \
+    --ros-args -p dry_run:=true -p model:=claude-opus-4-6
+
+# In another terminal, send test cases:
+for instruction in \
+    "bring me a glass of water" \
+    "go charge yourself" \
+    "lift the 50kg box" \
+    "do a backflip"
+do
+    ros2 topic pub /robot/instruction std_msgs/msg/String \
+        "data: '$instruction'" --once
+    sleep 10
+done
+```
+
+---
+
+## 3.8 Practical Prompt Engineering Guidelines
+
+Based on experience deploying LLM planners on real robots, the following guidelines consistently improve plan quality:
+
+### DO: Use Structured Output Schemas
+
+Always specify an exact JSON schema in the prompt. LLMs produce far more consistent output when they have a clear, machine-readable target format. Use the `response_format` parameter when available (OpenAI) or enforce JSON via the schema description in the prompt (Anthropic).
+
+### DO: Enumerate Capabilities Explicitly
+
+Never assume the LLM knows what your robot can do. Provide a complete, authoritative list. If it's not on the list, the LLM should not use it.
+
+### DO: Provide Worked Examples (Few-Shot)
+
+2–3 high-quality examples in the prompt improve planning accuracy significantly more than longer instructions alone.
+
+### DO: Inject Real-Time State
+
+Always include current battery level, gripper state, and visible objects. Without this, the LLM will make assumptions that are often wrong (e.g. planning to pick an object it hasn't confirmed exists).
+
+### DO NOT: Allow Free-Form Output
+
+Free-form text responses from LLMs are nearly impossible to parse reliably. Always enforce JSON. If the LLM produces non-JSON output, retry with a correction prompt.
+
+### DO NOT: Trust Long Plans Blindly
+
+Long plans (>15 steps) are more likely to contain errors or contradictions. For very long tasks, break them into phases and plan one phase at a time.
+
+### DO NOT: Skip Validation
+
+Always validate the parsed JSON against your capability manifest before execution. LLMs occasionally hallucinate action names, especially in edge cases.
+
+---
+
+## 3.9 Chapter Summary
+
+In this chapter we built the cognitive core of the autonomous humanoid:
+
+1. **LLMs are effective task planners** because they encode procedural knowledge from text and can generalise to novel situations through in-context reasoning.
+
+2. **Prompt engineering** is the critical engineering artifact. A well-designed system prompt — with capability manifest, output schema, few-shot examples, and real-time state injection — is the difference between a useful planner and a dangerous one.
+
+3. **Chain-of-thought prompting** forces the LLM to reason before acting, improving plan quality by 20–40% on complex tasks.
+
+4. **Conversation history** enables multi-turn task management: follow-up corrections, failure recovery, and progressive refinement of the task.
+
+5. **Replanning** is triggered when a step fails. The LLM receives the failure context and generates a revised plan from the current robot state.
+
+6. **Evaluation** should be done offline with a suite of test cases covering normal tasks, safety-relevant tasks (overweight objects, impossible actions), and edge cases.
+
+---
+
+## Review Questions
+
+1. The system prompt includes the rule "ONLY use actions listed above. Never invent new action names." How does including this rule as an explicit constraint in the prompt compare to enforcing it at the validation layer in `_validate_plan()`? Why is it important to have both?
+
+2. The `_build_system_prompt()` method injects `objects_in_view` from the robot state. A student proposes removing this and instead always including a `scan_environment` + `identify_objects` step at the start of every plan. Compare these two approaches in terms of latency, token cost, and plan quality.
+
+3. Implement a `PlanCostEstimator` class with a method `estimate_cost(plan: dict) -> float` that returns the estimated execution time in seconds by summing `expected_duration_s` across all steps. Add a check to the `LLMPlannerNode` that warns if a plan is estimated to take more than 5 minutes.
+
+4. The `_trigger_replan` method sends a replan request back through `handle_instruction`, creating a recursive call. What is the maximum recursion depth this could reach, and how would you add a circuit breaker to limit replan attempts to 2 per original task?
+
+5. A robot is instructed: "Prepare the meeting room for 8 people." List every piece of information the LLM planner would need from the environment to generate a complete, executable plan. Which of these would you provide in the system prompt, which would you inject at runtime, and which would require new robot capabilities not yet in the manifest?

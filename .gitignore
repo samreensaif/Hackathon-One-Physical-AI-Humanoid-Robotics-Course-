@@ -1,0 +1,29 @@
+# ── Secrets (never commit these) ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Node / Docusaurus ─────────────────────────────────────────────────────────
+node_modules/
+build/
+.docusaurus/
+.cache-loader/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Python / FastAPI backend ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+.pytest_cache/
+
+# ── OS / editor artefacts ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.claude/

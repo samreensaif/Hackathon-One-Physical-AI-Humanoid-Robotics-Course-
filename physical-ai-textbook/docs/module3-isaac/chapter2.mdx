@@ -1,0 +1,728 @@
+---
+title: "Chapter 2: Synthetic Data Generation"
+sidebar_position: 2
+---
+
+# Chapter 2: Synthetic Data Generation
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Articulate why synthetic data is essential for training robot perception models and how it reduces labelling costs
+- Explain the sim-to-real gap and identify the specific techniques used to close it
+- Implement domain randomisation across lighting, textures, materials, and object placement
+- Use the Isaac Sim Replicator API to write a programmatic synthetic data generation pipeline
+- Configure annotators to produce ground-truth labels for object detection, instance segmentation, depth estimation, and keypoint detection
+- Export a dataset in COCO and custom JSON formats suitable for training PyTorch models
+
+---
+
+## 2.1 The Data Problem in Robot Perception
+
+Training a deep neural network to perceive the world requires enormous amounts of annotated data. For an object detection model, "annotated" means every image needs bounding boxes drawn around every object of interest, labelled with the correct class. For a pose estimation model, every image needs 3D keypoint annotations. For a depth model, every pixel needs a ground-truth depth value.
+
+Collecting and annotating this data in the real world is extraordinarily expensive:
+
+```
+Real-world data collection costs (approximate):
+  ┌─────────────────────────────────────────────────────┐
+  │ Photographer / operator day rate:     $300–800/day  │
+  │ Object annotation (1 image):          $0.50–5.00    │
+  │ Semantic segmentation (1 image):      $5–50         │
+  │ 3D keypoint annotation (1 image):     $10–100       │
+  │                                                     │
+  │ To train a robust detector you need:  50,000+ images│
+  │ Estimated labelling cost:             $25,000–250,000│
+  └─────────────────────────────────────────────────────┘
+```
+
+Synthetic data generation produces **unlimited, perfectly annotated images at zero marginal cost**. The simulator knows the exact position, orientation, and identity of every object — ground-truth labels are generated automatically.
+
+---
+
+## 2.2 The Sim-to-Real Gap: Root Causes
+
+Simply rendering images in a simulator is not enough. A model trained only on synthetic data often fails on real images because of systematic differences between synthetic and real distributions. These differences are called the **sim-to-real gap**.
+
+### Sources of the Gap
+
+```
+Synthetic World                          Real World
+─────────────────────────────────────    ────────────────────────────────────
+Perfect, uniform lighting                Variable, directional, coloured light
+Smooth, clean surfaces                   Scratches, dust, wear, weathering
+Known, fixed object textures             Object appearance varies with age
+Idealized camera model                   Lens distortion, chromatic aberration
+No motion blur                           Motion blur at high speeds
+Exact object positions known             Object positions estimated / approximate
+No occlusion overlap errors              Heavy inter-object occlusion
+```
+
+### Techniques to Close the Gap
+
+| Technique | What It Does | Gap Source Targeted |
+|---|---|---|
+| **Domain randomisation** | Randomise lighting, textures, poses during generation | Lighting, texture, pose variance |
+| **Photorealistic rendering** | Use ray tracing to simulate real light physics | Lighting, shadows, reflections |
+| **PBR materials** | Physically-Based Rendering materials with correct roughness/metalness | Material appearance |
+| **Real background composition** | Composite rendered objects onto real background photos | Background distribution |
+| **Sensor noise models** | Add simulated camera noise, blur, distortion | Camera model |
+| **Real + synthetic mixing** | Train on 70% synthetic + 30% real images | All residual gaps |
+
+The most powerful single technique is **domain randomisation**: if you train on images with widely varying lighting, textures, and poses, the model is forced to learn appearance-invariant features, which transfer well to the real world.
+
+---
+
+## 2.3 Isaac Sim Replicator
+
+**NVIDIA Isaac Sim Replicator** is the programmatic synthetic data generation (SDG) framework built into Isaac Sim. It provides:
+
+- A Python API for **randomising** scene properties (lights, materials, transforms, cameras)
+- **Annotators** that attach to cameras to automatically output ground-truth labels
+- **Writers** that save data to disk in standard formats (COCO, KITTI, custom)
+- A **trigger** system for advancing the simulation deterministically
+
+### Replicator Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Replicator Pipeline                          │
+│                                                                 │
+│  Scene Setup           Randomisation         Data Collection    │
+│  ───────────           ─────────────         ────────────────   │
+│  Load objects          RandomizerGroup       Annotators:        │
+│  Place cameras    ──▶  • lights          ──▶ • BoundingBox2D    │
+│  Add backgrounds       • textures            • BoundingBox3D    │
+│  Configure annotators  • transforms          • Segmentation     │
+│                        • visibility          • Depth            │
+│                        • camera FOV          • Normals          │
+│                                              • Keypoints        │
+│                                                    │            │
+│                                            Writers:             │
+│                                            • COCO JSON          │
+│                                            • KITTI              │
+│                                            • Custom             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2.4 A Complete SDG Pipeline
+
+The following script generates a synthetic dataset of a humanoid robot arm picking up objects, with bounding box and segmentation annotations.
+
+### Step 1: Scene and Camera Setup
+
+```python
+# sdg_pipeline.py
+# Run with: ./python.sh sdg_pipeline.py
+
+import carb
+import omni.replicator.core as rep
+from omni.isaac.kit import SimulationApp
+
+CONFIG = {
+    "headless": True,           # Run without display for batch generation
+    "width": 1280,
+    "height": 720,
+    "renderer": "RayTracedLighting",
+}
+
+simulation_app = SimulationApp(CONFIG)
+
+import omni.kit.commands
+from omni.isaac.core import World
+from omni.isaac.core.utils.stage import add_reference_to_stage
+from omni.isaac.core.utils.nucleus import get_assets_root_path
+import numpy as np
+
+# ── Build the Scene ───────────────────────────────────────────────────
+world = World(stage_units_in_meters=1.0)
+world.scene.add_default_ground_plane()
+
+assets_root = get_assets_root_path()
+
+# Load a robot arm (e.g. Franka Panda)
+add_reference_to_stage(
+    usd_path=assets_root + "/Isaac/Robots/Franka/franka_alt_fingers.usd",
+    prim_path="/World/Franka"
+)
+
+# Load some target objects onto the table
+OBJECTS = [
+    ("/Isaac/Props/YCB/Axis_Aligned/003_cracker_box.usd", "/World/CrackerBox"),
+    ("/Isaac/Props/YCB/Axis_Aligned/005_tomato_soup_can.usd", "/World/SoupCan"),
+    ("/Isaac/Props/YCB/Axis_Aligned/021_bleach_cleanser.usd", "/World/Bleach"),
+]
+
+for usd_suffix, prim_path in OBJECTS:
+    add_reference_to_stage(
+        usd_path=assets_root + usd_suffix,
+        prim_path=prim_path
+    )
+
+world.reset()
+```
+
+### Step 2: Define Randomisers
+
+```python
+# ── Randomisation Groups ──────────────────────────────────────────────
+
+with rep.new_layer():
+
+    # ── Light Randomisation ───────────────────────────────────────────
+    # Creates a new dome light with randomised colour temperature and intensity
+    def randomise_lighting():
+        lights = rep.create.light(
+            light_type="Sphere",
+            temperature=rep.distribution.uniform(2800, 6500),    # Kelvin
+            intensity=rep.distribution.uniform(500, 5000),
+            position=rep.distribution.uniform(
+                (-3, -3, 2), (3, 3, 5)                          # Random position
+            ),
+            scale=rep.distribution.uniform(0.5, 3.0),
+            count=1,                                             # One light per frame
+        )
+        return lights.node
+
+    rep.randomizer.register(randomise_lighting)
+
+    # ── Object Transform Randomisation ────────────────────────────────
+    def randomise_object_poses():
+        """Randomise position and orientation of all YCB objects."""
+        objects = rep.get.prims(path_pattern="/World/CrackerBox|/World/SoupCan|/World/Bleach")
+        with objects:
+            rep.randomizer.scatter_2d(
+                surface_prims=[rep.get.prims(path_pattern="/World/defaultGroundPlane")],
+                check_for_collisions=True,
+            )
+            rep.modify.pose(
+                rotation=rep.distribution.uniform(
+                    (0, 0, 0), (0, 360, 0)                       # Random yaw rotation
+                ),
+            )
+        return objects.node
+
+    rep.randomizer.register(randomise_object_poses)
+
+    # ── Material / Texture Randomisation ─────────────────────────────
+    def randomise_ground_texture():
+        """Randomise the ground plane material."""
+        ground = rep.get.prims(path_pattern="/World/defaultGroundPlane/.*Mesh")
+        with ground:
+            rep.randomizer.materials(
+                rep.utils.get_usd_files(
+                    assets_root + "/Isaac/Materials/Textures/Patterns",
+                    recursive=True
+                )
+            )
+        return ground.node
+
+    rep.randomizer.register(randomise_ground_texture)
+```
+
+### Step 3: Attach the Camera and Annotators
+
+```python
+    # ── Camera Setup ─────────────────────────────────────────────────
+    camera = rep.create.camera(
+        position=rep.distribution.uniform((1.0, -1.5, 1.2), (1.5, 1.5, 2.0)),
+        look_at="/World/Franka",          # Always point at the robot
+        focal_length=rep.distribution.uniform(18.0, 35.0),  # Zoom randomisation
+    )
+
+    # Render product: ties the camera to a resolution
+    render_product = rep.create.render_product(camera, resolution=(1280, 720))
+
+    # ── Annotators ────────────────────────────────────────────────────
+    # Each annotator attaches to the render product and auto-generates labels
+
+    # 1. RGB image (the actual training image)
+    rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+    rgb_annotator.attach([render_product])
+
+    # 2. 2D bounding boxes
+    bbox2d_annotator = rep.AnnotatorRegistry.get_annotator(
+        "bounding_box_2d_tight"   # Tight boxes (no occluded area)
+    )
+    bbox2d_annotator.attach([render_product])
+
+    # 3. 3D bounding boxes (world-space corners)
+    bbox3d_annotator = rep.AnnotatorRegistry.get_annotator("bounding_box_3d")
+    bbox3d_annotator.attach([render_product])
+
+    # 4. Instance segmentation (each object gets a unique colour)
+    seg_annotator = rep.AnnotatorRegistry.get_annotator("instance_segmentation")
+    seg_annotator.attach([render_product])
+
+    # 5. Depth (metres from camera)
+    depth_annotator = rep.AnnotatorRegistry.get_annotator("distance_to_image_plane")
+    depth_annotator.attach([render_product])
+
+    # 6. Occlusion ratio (fraction of each object that is visible)
+    occlusion_annotator = rep.AnnotatorRegistry.get_annotator("occlusion")
+    occlusion_annotator.attach([render_product])
+```
+
+### Step 4: Configure the Writer and Trigger
+
+```python
+    # ── Writer: Save to COCO format ───────────────────────────────────
+    writer = rep.WriterRegistry.get("BasicWriter")
+    writer.initialize(
+        output_dir="/output/sdg_dataset",
+        rgb=True,
+        bounding_box_2d_tight=True,
+        bounding_box_3d=True,
+        instance_segmentation=True,
+        distance_to_image_plane=True,
+        occlusion=True,
+        image_format="png",
+    )
+    writer.attach([render_product])
+
+    # ── Trigger: Controls when randomisation fires ─────────────────────
+    # on_frame: runs once per render frame
+    with rep.trigger.on_frame(num_frames=1000):    # Generate 1000 images
+        rep.randomizer.randomise_lighting()
+        rep.randomizer.randomise_object_poses()
+        rep.randomizer.randomise_ground_texture()
+```
+
+### Step 5: Run the Generation Loop
+
+```python
+# ── Run the Pipeline ──────────────────────────────────────────────────
+print("Starting synthetic data generation...")
+
+# Orchestrator runs all registered randomisers and writers
+rep.orchestrator.run()
+
+# For headless batch generation, use step-and-wait:
+for i in range(1000):
+    rep.orchestrator.step(rt_subframes=1)   # 1 ray-trace subframe per sample
+    if i % 100 == 0:
+        print(f"Generated {i + 1} / 1000 images")
+
+print("Dataset generation complete. Saved to /output/sdg_dataset/")
+simulation_app.close()
+```
+
+---
+
+## 2.5 Understanding Annotator Outputs
+
+After running the pipeline, the output directory contains:
+
+```
+/output/sdg_dataset/
+├── rgb/
+│   ├── rgb_0000.png          ← Training image (1280×720, RGB)
+│   ├── rgb_0001.png
+│   └── ...
+├── bounding_box_2d_tight/
+│   ├── bounding_box_2d_tight_0000.npy    ← NumPy structured array
+│   └── ...
+├── instance_segmentation/
+│   ├── instance_segmentation_0000.png    ← Colour-coded instance map
+│   └── ...
+├── distance_to_image_plane/
+│   ├── distance_to_image_plane_0000.npy  ← Float32 depth in metres
+│   └── ...
+└── metadata.json             ← Camera intrinsics, class-to-ID mapping
+```
+
+### Reading Bounding Box Annotations in Python
+
+```python
+import numpy as np
+import json
+from pathlib import Path
+
+def load_bbox_sample(sample_idx: int, dataset_dir: str):
+    """Load one sample: image path + bounding box annotations."""
+
+    # Bounding box NumPy structured array
+    bbox_path = (
+        Path(dataset_dir) / "bounding_box_2d_tight" /
+        f"bounding_box_2d_tight_{sample_idx:04d}.npy"
+    )
+    bbox_data = np.load(str(bbox_path))
+
+    # Each row: (semanticId, x_min, y_min, x_max, y_max, occlusion_ratio)
+    print(f"Sample {sample_idx}: {len(bbox_data)} objects detected")
+    for row in bbox_data:
+        print(f"  Class {row['semanticId']:3d}  "
+              f"bbox=({row['x_min']:.0f}, {row['y_min']:.0f}, "
+              f"{row['x_max']:.0f}, {row['y_max']:.0f})  "
+              f"occlusion={row['occlusionRatio']:.2f}")
+
+    rgb_path = (
+        Path(dataset_dir) / "rgb" / f"rgb_{sample_idx:04d}.png"
+    )
+    return str(rgb_path), bbox_data
+
+# Load sample 0
+img_path, boxes = load_bbox_sample(0, "/output/sdg_dataset")
+print(f"Image: {img_path}")
+```
+
+### Reading Instance Segmentation
+
+```python
+from PIL import Image
+import numpy as np
+
+def load_segmentation(sample_idx: int, dataset_dir: str):
+    """Load instance segmentation mask."""
+    seg_path = (
+        Path(dataset_dir) / "instance_segmentation" /
+        f"instance_segmentation_{sample_idx:04d}.png"
+    )
+    seg_img = np.array(Image.open(seg_path))
+
+    # Each unique colour corresponds to one object instance
+    # Get unique instance IDs
+    unique_ids = np.unique(seg_img.reshape(-1, 3), axis=0)
+    print(f"Instance count: {len(unique_ids) - 1}")  # -1 for background
+    return seg_img
+```
+
+---
+
+## 2.6 Converting to COCO Format for PyTorch
+
+The COCO (Common Objects in Context) JSON format is the standard for object detection training with libraries like PyTorch's `torchvision`, Detectron2, and YOLO variants.
+
+```python
+# convert_to_coco.py
+import json
+import numpy as np
+from pathlib import Path
+from PIL import Image
+
+def sdg_to_coco(dataset_dir: str, output_path: str, class_map: dict):
+    """
+    Convert an Isaac Sim Replicator dataset to COCO JSON format.
+
+    class_map: {semantic_id: {"id": coco_id, "name": "class_name"}}
+    Example: {1: {"id": 1, "name": "cracker_box"},
+              2: {"id": 2, "name": "soup_can"}}
+    """
+    dataset_dir = Path(dataset_dir)
+
+    coco = {
+        "info": {
+            "description": "Isaac Sim Synthetic Dataset",
+            "version": "1.0",
+            "year": 2024,
+        },
+        "licenses": [],
+        "categories": [
+            {"id": v["id"], "name": v["name"], "supercategory": "object"}
+            for v in class_map.values()
+        ],
+        "images": [],
+        "annotations": [],
+    }
+
+    annotation_id = 0
+
+    rgb_files = sorted((dataset_dir / "rgb").glob("rgb_*.png"))
+
+    for image_id, rgb_file in enumerate(rgb_files):
+        sample_idx = int(rgb_file.stem.split("_")[-1])
+
+        # Get image dimensions
+        img = Image.open(rgb_file)
+        width, height = img.size
+
+        coco["images"].append({
+            "id": image_id,
+            "file_name": rgb_file.name,
+            "width": width,
+            "height": height,
+        })
+
+        # Load bounding boxes
+        bbox_file = (
+            dataset_dir / "bounding_box_2d_tight" /
+            f"bounding_box_2d_tight_{sample_idx:04d}.npy"
+        )
+        if not bbox_file.exists():
+            continue
+
+        bbox_data = np.load(str(bbox_file))
+
+        for row in bbox_data:
+            sem_id = int(row['semanticId'])
+            if sem_id not in class_map:
+                continue  # Skip background or unlabelled objects
+
+            x_min = float(row['x_min'])
+            y_min = float(row['y_min'])
+            x_max = float(row['x_max'])
+            y_max = float(row['y_max'])
+            w = x_max - x_min
+            h = y_max - y_min
+
+            if w <= 0 or h <= 0:
+                continue  # Skip degenerate boxes
+
+            occlusion = float(row.get('occlusionRatio', 0.0))
+            if occlusion > 0.9:
+                continue  # Skip >90% occluded objects
+
+            coco["annotations"].append({
+                "id": annotation_id,
+                "image_id": image_id,
+                "category_id": class_map[sem_id]["id"],
+                "bbox": [x_min, y_min, w, h],  # COCO: [x, y, w, h]
+                "area": w * h,
+                "iscrowd": 0,
+                "attributes": {"occlusion": occlusion},
+            })
+            annotation_id += 1
+
+    with open(output_path, 'w') as f:
+        json.dump(coco, f, indent=2)
+
+    print(f"COCO dataset saved: {output_path}")
+    print(f"  Images: {len(coco['images'])}")
+    print(f"  Annotations: {len(coco['annotations'])}")
+    return coco
+
+
+# Example usage
+class_map = {
+    1: {"id": 1, "name": "cracker_box"},
+    2: {"id": 2, "name": "soup_can"},
+    3: {"id": 3, "name": "bleach_cleanser"},
+}
+
+sdg_to_coco(
+    dataset_dir="/output/sdg_dataset",
+    output_path="/output/coco_annotations.json",
+    class_map=class_map
+)
+```
+
+---
+
+## 2.7 Training a Detector on the Synthetic Dataset
+
+Once you have the COCO JSON file, training with PyTorch is straightforward:
+
+```python
+# train_detector.py
+import torchvision
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.datasets import CocoDetection
+import torchvision.transforms as T
+from torch.utils.data import DataLoader
+import torch
+
+# ── Dataset ───────────────────────────────────────────────────────────
+transform = T.Compose([T.ToTensor()])
+
+train_dataset = CocoDetection(
+    root="/output/sdg_dataset/rgb",
+    annFile="/output/coco_annotations.json",
+    transforms=transform,
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=4,
+    shuffle=True,
+    collate_fn=lambda batch: tuple(zip(*batch)),
+)
+
+# ── Model: Faster R-CNN with ResNet-50 FPN backbone ───────────────────
+NUM_CLASSES = 4  # 3 objects + 1 background
+
+model = fasterrcnn_resnet50_fpn(
+    weights="DEFAULT",       # Start from ImageNet pre-trained weights
+    num_classes=NUM_CLASSES,
+)
+model.train()
+
+# ── Optimiser ─────────────────────────────────────────────────────────
+params = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+
+# ── Training Loop ─────────────────────────────────────────────────────
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+model.to(device)
+
+NUM_EPOCHS = 10
+for epoch in range(NUM_EPOCHS):
+    epoch_loss = 0.0
+    for images, targets in train_loader:
+        images = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+
+        epoch_loss += losses.item()
+
+    print(f"Epoch {epoch+1}/{NUM_EPOCHS}  Loss: {epoch_loss/len(train_loader):.4f}")
+
+torch.save(model.state_dict(), "detector_synthetic.pth")
+print("Model saved.")
+```
+
+---
+
+## 2.8 Domain Randomisation Strategies
+
+The quality of your synthetic dataset depends heavily on the diversity of your randomisation. Here are strategies used in production systems:
+
+### Lighting Randomisation
+
+```python
+def randomise_lighting_advanced():
+    """
+    Production-grade lighting randomisation:
+    - Variable number of lights (1–4)
+    - Mixed light types (sphere, disk, distant)
+    - Randomised HDR environment maps
+    """
+    # Random number of point lights
+    num_lights = np.random.randint(1, 5)
+    lights = rep.create.light(
+        light_type=rep.distribution.choice(["Sphere", "Disk", "Distant"]),
+        temperature=rep.distribution.uniform(2200, 7500),
+        intensity=rep.distribution.uniform(200, 10000),
+        position=rep.distribution.uniform((-5, -5, 1), (5, 5, 6)),
+        count=num_lights,
+    )
+
+    # Add a randomised dome light (HDR environment map)
+    dome = rep.create.light(
+        light_type="Dome",
+        texture=rep.distribution.choice([
+            "omniverse://localhost/NVIDIA/Assets/Skies/Clear/clear_sky.hdr",
+            "omniverse://localhost/NVIDIA/Assets/Skies/Overcast/overcast.hdr",
+            "omniverse://localhost/NVIDIA/Assets/Skies/Night/night_sky.hdr",
+        ]),
+        intensity=rep.distribution.uniform(100, 2000),
+    )
+    return lights.node
+```
+
+### Object Distractors
+
+Add random "distractor" objects that do not belong to any training class. These force the model to learn what objects look like (not just where objects typically appear):
+
+```python
+def add_distractor_objects():
+    """Add random household objects as distractors."""
+    DISTRACTOR_PATHS = [
+        "/Isaac/Props/Blocks/red_block.usd",
+        "/Isaac/Props/Blocks/blue_block.usd",
+        "/Isaac/Props/KLT_Bin/KLT_bin.usd",
+    ]
+    for i, path in enumerate(np.random.choice(DISTRACTOR_PATHS, size=5)):
+        add_reference_to_stage(
+            usd_path=assets_root + path,
+            prim_path=f"/World/Distractor_{i}"
+        )
+```
+
+### Camera Noise Models
+
+```python
+def add_camera_noise(render_product):
+    """Simulate real camera imperfections."""
+    # Chromatic aberration (colour channel offset)
+    rep.modify.render_settings(
+        chromatic_aberration_strength=rep.distribution.uniform(0.0, 0.003),
+    )
+    # Motion blur
+    rep.modify.render_settings(
+        motion_blur_fraction=rep.distribution.uniform(0.0, 0.05),
+    )
+```
+
+---
+
+## 2.9 Evaluating Synthetic-to-Real Transfer
+
+After training on synthetic data, evaluate on **real images** to measure how well the model generalises. A standard metric is the mean Average Precision at IoU threshold 0.5 (mAP@0.5):
+
+```python
+# evaluate_transfer.py
+from torchvision.datasets import CocoDetection
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+import torchvision.transforms as T
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+import torch
+
+# Load your real-image test set (you need to collect and annotate ~200 real images)
+test_dataset = CocoDetection(
+    root="/real_images/test",
+    annFile="/real_images/test_annotations.json",
+    transforms=T.Compose([T.ToTensor()]),
+)
+
+model = fasterrcnn_resnet50_fpn(num_classes=4)
+model.load_state_dict(torch.load("detector_synthetic.pth"))
+model.eval()
+
+metric = MeanAveragePrecision(iou_type="bbox")
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+with torch.no_grad():
+    for images, targets in DataLoader(test_dataset, batch_size=1):
+        images = [img.to(device) for img in images]
+        predictions = model(images)
+        metric.update(predictions, targets)
+
+results = metric.compute()
+print(f"mAP@0.5: {results['map_50']:.4f}")
+print(f"mAP@0.5:0.95: {results['map']:.4f}")
+```
+
+**Benchmarking rule of thumb**: A well-randomised Isaac Sim synthetic dataset typically achieves 60–80% of the mAP that an equivalently sized real-image dataset achieves. Adding a small number (500–1000) of real annotated images to fine-tune the model usually closes most of the remaining gap.
+
+---
+
+## 2.10 Chapter Summary
+
+Synthetic data generation is one of the most powerful tools in the robot AI developer's arsenal:
+
+1. **The data problem**: Real-world data is expensive to collect and annotate. Synthetic data is unlimited and auto-labelled.
+
+2. **The sim-to-real gap** arises from mismatches in lighting, texture, material appearance, and camera models. Domain randomisation, photorealistic rendering, and noise models close this gap.
+
+3. **Isaac Sim Replicator** provides a Python API to define randomisers, annotators, and writers as a composable pipeline. The `with rep.new_layer()` + `rep.trigger.on_frame()` pattern drives deterministic data generation.
+
+4. **Annotators** (bounding box, segmentation, depth, occlusion) generate ground-truth labels automatically without any human effort.
+
+5. **COCO format** is the standard for object detection datasets. The `sdg_to_coco` converter transforms Replicator output into a format accepted by PyTorch's `torchvision`, Detectron2, and YOLO.
+
+6. **Synthetic-to-real transfer** is measured by evaluating on real images. A small real-image fine-tuning step closes most residual gaps.
+
+---
+
+## Review Questions
+
+1. A colleague argues that using 1,000,000 synthetic images is always better than 10,000 real images for training an object detector. Critique this argument — under what specific conditions might the real images outperform the synthetic ones?
+
+2. Explain why "distractor objects" improve model performance. What failure mode would you expect in a model trained without distractors, and how would you demonstrate this failure experimentally?
+
+3. You are generating a synthetic dataset for training a robot to pick up coffee mugs. List five specific scene properties you would randomise and justify each choice with a concrete real-world scenario your robot might encounter.
+
+4. The `load_bbox_sample` function above loads bounding boxes from a NumPy structured array. Write a function `visualise_sample(sample_idx, dataset_dir)` that loads the RGB image with Pillow, draws the bounding boxes on it using `PIL.ImageDraw`, colours each box by class, and saves the annotated image.
+
+5. A team trains on 50,000 synthetic images and achieves mAP@0.5 = 0.42 on their real-image test set. They argue the synthetic data is useless and want to collect 5,000 real images instead. What counter-proposal would you make? Describe a mixed-data training strategy and explain why it is likely to outperform either approach alone.

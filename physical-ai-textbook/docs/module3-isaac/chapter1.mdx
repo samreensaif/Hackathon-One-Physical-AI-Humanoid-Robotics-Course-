@@ -1,0 +1,479 @@
+---
+title: "Chapter 1: NVIDIA Isaac Sim Overview"
+sidebar_position: 1
+---
+
+# Chapter 1: NVIDIA Isaac Sim Overview
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Describe the NVIDIA Omniverse platform and explain how Isaac Sim fits within it
+- Explain the Universal Scene Description (USD) format and its advantages over legacy robot description formats
+- Identify the hardware requirements for running Isaac Sim and understand why an RTX GPU is mandatory
+- Distinguish between Isaac Sim, Isaac Lab, and Isaac ROS and choose the right tool for a given task
+- Launch Isaac Sim, load a robot, and run a basic Python simulation script using the Omniverse Kit SDK
+- Explain how photorealistic rendering improves the realism of training data and reduces the sim-to-real gap
+
+---
+
+## 1.1 The Simulation Imperative
+
+Training and testing AI-powered robots in the real world is expensive, slow, and dangerous. A humanoid robot that falls during a poorly tuned gait experiment can destroy $150,000 of hardware and injure nearby people. A self-driving car that misidentifies a stop sign during real-world testing has catastrophic consequences.
+
+Simulation solves this problem by providing a **safe, fast, infinitely resettable** environment. But not all simulators are equal. Classic robot simulators like Gazebo and PyBullet prioritise physics speed over visual fidelity, producing synthetic images that look nothing like the real world. When a neural network trained on these images is deployed on a real robot — a problem called the **sim-to-real gap** — it often fails immediately.
+
+**NVIDIA Isaac Sim** takes a radically different approach. Built on the NVIDIA Omniverse platform with ray-traced photorealistic rendering, it produces images that are nearly indistinguishable from real camera footage. This dramatically reduces the sim-to-real gap and enables AI models to be trained almost entirely in simulation.
+
+---
+
+## 1.2 The NVIDIA Omniverse Platform
+
+Isaac Sim is not a standalone application — it is one application built on the **NVIDIA Omniverse** platform. Understanding Omniverse is prerequisite to understanding Isaac Sim.
+
+### What Is Omniverse?
+
+Omniverse is NVIDIA's platform for building and connecting 3D simulation, design, and collaboration tools. It consists of:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Omniverse Platform                       │
+├──────────────────┬──────────────────────┬───────────────────────┤
+│  Omniverse Kit   │   USD (Scene Format) │   RTX Renderer        │
+│  (App Framework) │   (Data Interchange) │   (PhysX + Ray Trace) │
+├──────────────────┴──────────────────────┴───────────────────────┤
+│              Omniverse Nucleus (Asset & Scene Server)           │
+├─────────────────────────────────────────────────────────────────┤
+│        Built-on-Omniverse Applications                          │
+│  Isaac Sim │ Isaac Lab │ Omniverse Farm │ USD Composer │ Drive Sim│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Omniverse Kit
+
+**Omniverse Kit** is the SDK used to build Omniverse applications. It provides:
+- A Python-extensible application framework
+- Real-time 3D viewport with RTX rendering
+- Plugin architecture for physics engines, AI tools, and ROS bridges
+- A built-in Python interpreter (`omni.kit`) accessible via scripting console
+
+Every Isaac Sim Python API call goes through Omniverse Kit extensions.
+
+### The RTX Renderer
+
+The rendering engine in Omniverse uses NVIDIA's **RTX** (Ray Tracing) technology to simulate light physically accurately:
+
+- **Ray tracing**: models individual photons bouncing off surfaces
+- **Path tracing**: Monte Carlo sampling of full light paths for ground-truth quality
+- **Real-time RTX**: denoised ray tracing at interactive frame rates
+
+This matters for robotics AI because perception models trained on ray-traced images encounter lighting, reflections, and shadows that match the real world — the core reason Isaac Sim produces better training data than rasterised simulators.
+
+---
+
+## 1.3 Universal Scene Description (USD)
+
+Every scene, robot, and asset in Isaac Sim is represented in **USD** (Universal Scene Description), a format developed by Pixar Animation Studios and now maintained as an open standard.
+
+### Why USD?
+
+Before USD, every 3D application had its own proprietary format: Maya had `.mb`, Blender had `.blend`, ROS had URDF. Exchanging assets between tools required error-prone manual conversion. USD solves this with a single, composable, non-destructive format that all tools can read and write.
+
+### USD Core Concepts
+
+```
+USD Stage (the scene)
+  └── Prim (every object is a "prim")
+        ├── Xform  (transform: position, rotation, scale)
+        ├── Mesh   (geometry: vertices, faces, UVs)
+        ├── Material (PBR shader inputs)
+        ├── PhysicsRigidBodyAPI  (physics properties)
+        ├── PhysicsCollisionAPI  (collision shape)
+        └── RobotAPI / JointAPI  (articulation properties)
+```
+
+Key USD concepts for roboticists:
+
+| Concept | Meaning |
+|---|---|
+| **Stage** | The entire scene (like a `.blend` file or a ROS world) |
+| **Prim** | Any object in the scene (mesh, light, camera, joint) |
+| **Layer** | A file that overrides properties of a base USD stage |
+| **Composition** | Combining multiple USD files — e.g. robot URDF + environment USD |
+| **Schema** | A typed API applied to a prim — e.g. `PhysicsRigidBodyAPI` |
+| **Payload** | Lazy-loading of heavy assets (loads on demand, not at startup) |
+
+### USD Layers: Non-Destructive Overrides
+
+USD's **layering** system allows you to modify a scene without changing its base files. For example:
+
+```
+base_robot.usd          ← Manufacturer's robot model (read-only)
+    └── my_experiment.usd  ← Your overrides: new sensors, materials, poses
+```
+
+This is analogous to Git branches: the base is untouched; you compose variations on top. This is how Isaac Sim's **domain randomisation** works — it writes property overrides into a temporary layer.
+
+### Converting URDF to USD
+
+Isaac Sim can import URDF files and convert them to USD:
+
+```python
+# In Isaac Sim Python console or script
+from omni.isaac.urdf import _urdf
+
+urdf_interface = _urdf.acquire_urdf_interface()
+config = _urdf.ImportConfig()
+config.merge_fixed_joints = False
+config.fix_base = False
+config.import_inertia_tensor = True
+config.distance_scale = 1.0
+config.density = 0.0
+config.default_drive_type = _urdf.UrdfJointTargetType.JOINT_DRIVE_VELOCITY
+config.default_drive_strength = 1047.197551
+config.default_position_drive_damping = 52.35988
+
+result, prim_path = omni.kit.commands.execute(
+    "URDFParseAndImportFile",
+    urdf_path="/path/to/humanoid.urdf",
+    import_config=config,
+)
+print(f"Robot imported at: {prim_path}")
+```
+
+---
+
+## 1.4 Hardware Requirements
+
+Isaac Sim's RTX rendering places substantial demands on your GPU. These are not optional — they reflect genuine computational requirements of real-time path tracing.
+
+### Minimum vs Recommended Hardware
+
+| Component | Minimum | Recommended | Notes |
+|---|---|---|---|
+| **GPU** | RTX 3070 8 GB | RTX 4090 24 GB | **Must be RTX** — no GTX, no AMD for full features |
+| **CPU** | Intel i7 / Ryzen 7 | Intel i9 / Ryzen 9 | Multi-core for physics simulation |
+| **RAM** | 32 GB | 64 GB | Large scenes + Python runtime + ML models |
+| **VRAM** | 8 GB | 24 GB | Complex scenes with many assets exhaust VRAM |
+| **Storage** | 50 GB SSD | 500 GB NVMe SSD | Isaac Sim install + nucleus assets |
+| **OS** | Ubuntu 20.04 / 22.04 | Ubuntu 22.04 | Windows 10/11 supported but Linux preferred |
+
+### Cloud Deployment
+
+For teams without high-end GPUs, NVIDIA offers **Isaac Sim on AWS** through the NGC (NVIDIA GPU Cloud) catalog. You can rent an `g4dn.xlarge` (T4) or `p3.2xlarge` (V100) instance and run Isaac Sim headlessly, streaming the viewport to your local machine.
+
+```bash
+# Run Isaac Sim headlessly (no display required)
+./runheadless.native.sh --/app/window/width=1280 --/app/window/height=720
+```
+
+Headless mode is essential for large-scale synthetic data generation on cloud GPU farms.
+
+---
+
+## 1.5 The Isaac Ecosystem: Sim, Lab, and ROS
+
+NVIDIA's Isaac brand encompasses three distinct but complementary products. Students often confuse them.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  NVIDIA Isaac Ecosystem                                             │
+├──────────────────┬──────────────────────┬───────────────────────────┤
+│  Isaac Sim       │  Isaac Lab           │  Isaac ROS                │
+│                  │                      │                           │
+│  Full simulation │  Reinforcement       │  Hardware-accelerated     │
+│  environment     │  learning framework  │  ROS 2 packages for       │
+│  • Photorealistic│  • Built on Isaac Sim│  deployment on real       │
+│    rendering     │  • GPU-parallelised  │  robots                   │
+│  • Synthetic data│    RL training       │  • cuVSLAM                │
+│    generation    │  • Imitation learning│  • Nvblox 3D mapping      │
+│  • Physics (PhysX│  • Task design API   │  • AprilTag detection     │
+│    + Flex)       │  • 4096+ envs        │  • Stereo depth           │
+│  • ROS 2 bridge  │    simultaneously    │  • Runs on Jetson Orin    │
+└──────────────────┴──────────────────────┴───────────────────────────┘
+```
+
+### When to Use Each
+
+- **Isaac Sim**: Develop and test robot behaviours; generate synthetic training data; test navigation and manipulation
+- **Isaac Lab**: Train reinforcement learning policies at scale; train locomotion controllers for humanoids
+- **Isaac ROS**: Deploy pre-trained models on a real robot with Jetson hardware acceleration
+
+A typical development pipeline uses all three:
+1. Train locomotion in **Isaac Lab** (millions of simulated steps in hours)
+2. Test full-stack behaviour in **Isaac Sim** (photorealistic, with sensors)
+3. Deploy on hardware using **Isaac ROS** (Jetson-accelerated inference)
+
+---
+
+## 1.6 Setting Up Isaac Sim
+
+### Installation via Omniverse Launcher
+
+```bash
+# 1. Download the Omniverse Launcher from developer.nvidia.com/omniverse
+# 2. Install it:
+chmod +x omniverse-launcher-linux.AppImage
+./omniverse-launcher-linux.AppImage
+
+# 3. From the Launcher UI, install "Isaac Sim" (≈15 GB download)
+# 4. Also install "Nucleus" local server for assets
+```
+
+### First Launch and the Python Console
+
+After launch, Isaac Sim opens with a 3D viewport. The built-in **Script Editor** (Window → Script Editor) allows running Python scripts against the live simulation.
+
+```python
+# Script Editor: Hello World — create a sphere in the scene
+import omni.kit.commands
+import omni
+
+# Create a sphere prim at the origin
+omni.kit.commands.execute(
+    'CreateMeshPrimWithDefaultXform',
+    prim_type='Sphere',
+)
+
+# Select it and move it up 1 metre
+from pprint import pprint
+stage = omni.usd.get_context().get_stage()
+sphere_prim = stage.GetPrimAtPath('/World/Sphere')
+xform = sphere_prim.GetAttribute('xformOp:translate')
+xform.Set((0.0, 0.0, 1.0))
+
+print("Sphere created at (0, 0, 1)")
+```
+
+---
+
+## 1.7 Loading a Robot and Running Physics
+
+Isaac Sim ships with pre-built robot USD assets for popular platforms (Franka, UR10, Carter, Spot, H1). Here is a complete Python script that loads a humanoid robot and runs a physics simulation:
+
+```python
+# standalone_simulation.py
+# Run with: ./python.sh standalone_simulation.py
+
+import carb
+from omni.isaac.kit import SimulationApp
+
+# Must create SimulationApp BEFORE importing any omni modules
+simulation_app = SimulationApp({
+    "headless": False,          # Set True for server-side rendering
+    "width": 1280,
+    "height": 720,
+    "renderer": "RayTracedLighting",
+})
+
+# Now safe to import Isaac Sim modules
+import omni.kit.commands
+from omni.isaac.core import World
+from omni.isaac.core.robots import Robot
+from omni.isaac.core.utils.stage import add_reference_to_stage
+from omni.isaac.core.utils.nucleus import get_assets_root_path
+import numpy as np
+
+# ── Scene Setup ──────────────────────────────────────────────────────
+world = World(
+    stage_units_in_meters=1.0,
+    physics_dt=1.0 / 400.0,     # Physics runs at 400 Hz
+    rendering_dt=1.0 / 60.0,    # Renderer at 60 Hz
+)
+
+# Add a ground plane
+world.scene.add_default_ground_plane()
+
+# ── Load Robot Asset ─────────────────────────────────────────────────
+assets_root = get_assets_root_path()
+# Unitree H1 humanoid (available in Isaac Sim asset library)
+robot_asset_path = (
+    assets_root + "/Isaac/Robots/Unitree/H1/h1.usd"
+)
+
+# Add the robot USD to the stage
+add_reference_to_stage(
+    usd_path=robot_asset_path,
+    prim_path="/World/H1"
+)
+
+# Wrap it in a Robot object for easy control
+robot = world.scene.add(
+    Robot(
+        prim_path="/World/H1",
+        name="h1_robot",
+        position=np.array([0.0, 0.0, 1.05]),  # Spawn 1.05m above ground
+    )
+)
+
+# ── Lighting ─────────────────────────────────────────────────────────
+from omni.isaac.core.utils.prims import create_prim
+# Add a distant light (simulates sunlight)
+omni.kit.commands.execute(
+    "CreatePrim",
+    prim_path="/World/DistantLight",
+    prim_type="DistantLight",
+    attributes={
+        "inputs:intensity": 3000.0,
+        "inputs:angle": 0.53,
+        "xformOp:rotateXYZ": (315.0, 0.0, 0.0),
+    }
+)
+
+# ── Simulation Loop ───────────────────────────────────────────────────
+world.reset()
+
+num_dof = robot.num_dof
+print(f"Robot has {num_dof} degrees of freedom.")
+print(f"Joint names: {robot.dof_names}")
+
+step = 0
+while simulation_app.is_running():
+    # Step the physics and renderer
+    world.step(render=True)
+
+    if world.is_playing():
+        # Read current joint positions
+        joint_positions = robot.get_joint_positions()
+
+        # Read base (root) position and orientation
+        base_pos, base_rot = robot.get_world_pose()
+
+        if step % 100 == 0:  # Print every 100 steps
+            print(f"Step {step}: base_z = {base_pos[2]:.3f} m")
+            print(f"  joint[0] = {joint_positions[0]:.4f} rad")
+
+        step += 1
+
+# Cleanup
+simulation_app.close()
+```
+
+Run it from the Isaac Sim Python environment:
+
+```bash
+cd ~/.local/share/ov/pkg/isaac-sim-4.x.x/
+./python.sh /path/to/standalone_simulation.py
+```
+
+---
+
+## 1.8 Isaac Sim's Physics Engine: PhysX
+
+Isaac Sim uses NVIDIA's **PhysX** physics engine, which runs on the GPU for massively parallel simulation. Key features relevant to humanoid robotics:
+
+### Articulation
+
+A **PhysX Articulation** is the rigid body representation of a kinematic chain — exactly what a robot arm or humanoid body is. Articulations are more stable and faster than simulating each link as a separate rigid body.
+
+```python
+from omni.isaac.core.articulations import Articulation
+
+# Get the robot as an articulation for direct joint control
+articulation = Articulation(prim_path="/World/H1")
+world.scene.add(articulation)
+world.reset()
+
+# Set joint position targets (PD controller)
+articulation.get_articulation_controller().apply_action(
+    ArticulationAction(
+        joint_positions=np.zeros(num_dof),    # Target: all joints at 0
+        joint_velocities=np.zeros(num_dof),
+        joint_efforts=None,                    # Let PD handle it
+    )
+)
+```
+
+### Contact Sensors
+
+```python
+from omni.isaac.sensor import ContactSensor
+
+# Attach contact sensors to robot feet
+left_foot_sensor = ContactSensor(
+    prim_path="/World/H1/left_ankle_roll_link/contact_sensor",
+    name="left_foot_contact",
+    min_threshold=0,
+    max_threshold=10000000,
+    radius=-1,  # -1 = use collision shape
+)
+world.scene.add(left_foot_sensor)
+
+# In simulation loop:
+contact_data = left_foot_sensor.get_current_frame()
+if contact_data["in_contact"]:
+    print(f"Left foot contact force: {contact_data['force']}")
+```
+
+---
+
+## 1.9 The ROS 2 Bridge
+
+Isaac Sim can publish and subscribe to ROS 2 topics, making it a drop-in replacement for a real robot during software development.
+
+```python
+# Enable the ROS 2 bridge extension
+import omni.ext
+import omni.graph.core as og
+
+# Action Graph for ROS 2 clock publisher
+og.Controller.edit(
+    {"graph_path": "/ROS2_Clock", "evaluator_name": "execution"},
+    {
+        og.Controller.Keys.CREATE_NODES: [
+            ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+            ("ROS2Clock",      "omni.isaac.ros2_bridge.ROS2PublishClock"),
+        ],
+        og.Controller.Keys.CONNECT: [
+            ("OnPlaybackTick.outputs:tick", "ROS2Clock.inputs:execIn"),
+        ],
+    }
+)
+```
+
+Once the bridge is active, you can verify the connection:
+
+```bash
+# In a terminal with ROS 2 sourced:
+ros2 topic list
+# Should show:
+# /clock
+# /tf
+# /joint_states
+# /camera/image_raw   (if a camera sensor is configured)
+```
+
+---
+
+## 1.10 Chapter Summary
+
+In this chapter you established the conceptual and practical foundation for working with Isaac Sim:
+
+1. **Simulation necessity**: The sim-to-real gap is the central problem in robot AI training. Isaac Sim addresses it with RTX photorealistic rendering.
+
+2. **Omniverse platform**: Isaac Sim is built on Omniverse Kit, which provides the application framework, RTX renderer, and USD scene format.
+
+3. **USD**: The Universal Scene Description format enables composable, non-destructive scene representation. Layers allow domain randomisation without modifying base assets.
+
+4. **Hardware requirements**: An RTX GPU with ≥8 GB VRAM is mandatory. Headless cloud deployment on AWS/GCP is a viable alternative.
+
+5. **Isaac ecosystem**: Isaac Sim (simulation), Isaac Lab (RL training), and Isaac ROS (deployment) are complementary tools covering the full robot AI pipeline.
+
+6. **Python scripting**: The `SimulationApp` + `World` + `Robot`/`Articulation` pattern is the foundation of all Isaac Sim Python scripts.
+
+7. **ROS 2 bridge**: Isaac Sim publishes sensor data and subscribes to command topics, making it transparent to your ROS 2 software stack.
+
+---
+
+## Review Questions
+
+1. Explain the sim-to-real gap in your own words. Why does photorealistic rendering (ray tracing) help close this gap more than rasterised rendering?
+
+2. What is a USD Layer, and how does it relate to domain randomisation? Draw a diagram showing the layer composition for a robot with three different material randomisations.
+
+3. Your lab has a single workstation with an NVIDIA GTX 1080 Ti (8 GB VRAM, no RT cores). Can you run Isaac Sim on it? What are your alternatives?
+
+4. What is the difference between Isaac Sim and Isaac Lab? If you wanted to train a walking controller for a bipedal robot using reinforcement learning on 4,096 parallel environments, which would you use?
+
+5. Sketch the data flow from a camera sensor in Isaac Sim to a PyTorch object detection model running in a separate Python process. List every technology at each step (USD prim → Isaac Sim extension → ROS 2 bridge → ROS 2 topic → subscriber node → tensor).

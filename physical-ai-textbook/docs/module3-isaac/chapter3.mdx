@@ -1,0 +1,641 @@
+---
+title: "Chapter 3: Isaac ROS and Visual SLAM"
+sidebar_position: 3
+---
+
+# Chapter 3: Isaac ROS and Visual SLAM
+
+## Learning Objectives
+
+By the end of this chapter, you will be able to:
+
+- Explain what Isaac ROS is and how it differs from Isaac Sim
+- Identify the key hardware-accelerated packages in the Isaac ROS GEM library and their use cases
+- Describe the core mathematical principles behind Visual SLAM (V-SLAM)
+- Explain how cuVSLAM achieves real-time SLAM performance on the NVIDIA Jetson Orin
+- Set up a Jetson Orin development environment with Isaac ROS installed
+- Build and run a cuVSLAM pipeline in a ROS 2 workspace
+- Interpret SLAM output (pose, map cloud, odometry) and feed it into downstream navigation
+
+---
+
+## 3.1 From Simulation to Deployment: The Role of Isaac ROS
+
+Isaac Sim is where you develop and test. Isaac ROS is where you **deploy**.
+
+Once a perception or navigation algorithm has been validated in simulation, it needs to run on a real robot. For humanoid and mobile robots, that typically means running on an **NVIDIA Jetson** — a compact, power-efficient AI compute module designed for edge inference.
+
+```
+Development Pipeline:
+  ┌─────────────┐      ┌─────────────┐      ┌──────────────────┐
+  │  Isaac Sim  │      │  Isaac Lab  │      │   Isaac ROS      │
+  │  (Workstation│──▶  │  (GPU Cluster│──▶  │  (Jetson Orin)   │
+  │  RTX 4090)  │      │  Train policy│      │  Deploy + serve  │
+  │  Test stack │      │             │      │  perception +    │
+  │  Gen synth  │      │             │      │  navigation      │
+  │  data       │      │             │      │  at 30+ Hz       │
+  └─────────────┘      └─────────────┘      └──────────────────┘
+```
+
+Isaac ROS packages are **hardware-accelerated** versions of common robotics algorithms, implemented using NVIDIA's CUDA, TensorRT, and cuDNN libraries. They are packaged as standard **ROS 2 nodes** that slot directly into an existing ROS 2 workspace — the same topics and services from Module 1 apply.
+
+---
+
+## 3.2 The Isaac ROS GEM Library
+
+GEM stands for **GPU-Efficient Module**. Each GEM is a ROS 2 package that accelerates a specific robotics task. As of 2024, the Isaac ROS GEM library includes:
+
+| Package | Function | Acceleration |
+|---|---|---|
+| `isaac_ros_visual_slam` | 6-DoF pose estimation and mapping (cuVSLAM) | CUDA, GPU |
+| `isaac_ros_nvblox` | Real-time 3D occupancy + ESDF mapping | CUDA |
+| `isaac_ros_object_detection` | Detectnet / YOLOv8 inference | TensorRT |
+| `isaac_ros_image_segmentation` | Semantic segmentation | TensorRT |
+| `isaac_ros_pose_estimation` | 6-DoF object pose (FoundationPose, DOPE) | TensorRT |
+| `isaac_ros_apriltag` | AprilTag fiducial detection | CUDA |
+| `isaac_ros_depth_segmentation` | Freespace segmentation from depth | CUDA |
+| `isaac_ros_stereo_image_proc` | Stereo disparity and point cloud | CUDA |
+| `isaac_ros_image_proc` | Colour conversion, rectification | CUDA |
+| `isaac_ros_argus_camera` | Direct CSI camera driver | ISP hardware |
+
+### Acceleration Factors
+
+For context on what hardware acceleration means in practice:
+
+```
+Algorithm             CPU (x86 laptop)    Jetson Orin (GPU)    Speedup
+─────────────         ────────────────    ─────────────────    ───────
+AprilTag detection    12 Hz               200+ Hz              17×
+cuVSLAM               Not real-time       300 Hz               ∞
+Stereo disparity      5 Hz                60+ Hz               12×
+Object detection (TensorRT YOLO) 2 Hz     60 Hz                30×
+```
+
+These speedups make the difference between an algorithm that is theoretically correct and one that actually works on a moving robot.
+
+---
+
+## 3.3 Visual SLAM: Conceptual Foundation
+
+**SLAM** (Simultaneous Localisation and Mapping) is the problem of answering two questions simultaneously:
+
+1. **Where am I?** (Localisation: estimating the robot's 6-DoF pose in a coordinate frame)
+2. **What does the world look like?** (Mapping: building a map of the environment)
+
+These problems are coupled: you need a map to localise, and you need localisation to build a map. SLAM algorithms solve both simultaneously.
+
+**Visual SLAM** uses cameras as the primary sensor, instead of LiDAR (which is heavier, more expensive, and consumes more power). This makes it ideal for humanoid robots that carry cameras for other purposes.
+
+### The Core V-SLAM Pipeline
+
+```
+Camera frames (stereo or RGB-D)
+        │
+        ▼
+┌───────────────────────────────┐
+│  Feature Extraction           │
+│  Find keypoints in the image  │
+│  (corners, edges, blobs)      │
+│  Compute descriptors for each │
+└──────────────┬────────────────┘
+               │
+               ▼
+┌───────────────────────────────┐
+│  Feature Matching & Tracking  │
+│  Match features across frames │
+│  Reject outliers (RANSAC)     │
+└──────────────┬────────────────┘
+               │
+               ▼
+┌───────────────────────────────┐
+│  Motion Estimation            │
+│  Compute camera motion from   │
+│  matched feature positions    │
+│  (PnP solver, Essential Matrix│
+└──────────────┬────────────────┘
+               │
+               ▼
+┌───────────────────────────────┐
+│  Pose Graph Optimisation      │
+│  Bundle adjustment: refine    │
+│  poses + 3D point positions   │
+│  simultaneously               │
+└──────────────┬────────────────┘
+               │
+               ▼
+┌───────────────────────────────┐
+│  Loop Closure Detection       │
+│  Recognise previously-visited │
+│  places; correct drift        │
+└──────────────┬────────────────┘
+               │
+        ┌──────┴──────┐
+        ▼             ▼
+  Robot Pose     3D Point Cloud Map
+  (6-DoF)        (landmarks)
+```
+
+### Key Mathematical Concepts
+
+**Feature detection** finds distinctive points in an image. In cuVSLAM, NVIDIA uses a GPU-accelerated version of Harris corner detection combined with ORB (Oriented FAST and Rotated BRIEF) descriptors.
+
+**The Fundamental/Essential Matrix** relates corresponding points in stereo or consecutive frames via the equation:
+
+```
+p2^T · E · p1 = 0
+```
+
+Where `p1`, `p2` are normalised image coordinates of a matched feature, and `E` is the 3×3 Essential Matrix encoding relative rotation R and translation t.
+
+**Bundle Adjustment** minimises the reprojection error across all camera poses and 3D points simultaneously — a large, sparse least-squares problem solved efficiently with the Ceres or g2o libraries.
+
+**Loop closure** is the algorithm's mechanism for correcting accumulated drift. When the robot returns to a previously visited location, the recogniser identifies it from a bag-of-words or global feature descriptor match, and a pose graph edge is added to correct the accumulated error.
+
+### Stereo vs Monocular vs RGB-D
+
+| Setup | Pros | Cons | Best for |
+|---|---|---|---|
+| **Stereo** | True scale, good depth | Heavier, needs calibration | Outdoor, large spaces |
+| **Monocular** | Lightest, single camera | No true scale, scale drift | Constrained indoor |
+| **RGB-D** | Dense depth per-frame | Short range (≤5m), IR interference | Indoor manipulation |
+| **Stereo + IMU** | Scale-correct, robust motion | Complex calibration | Humanoid robots (fast motion) |
+
+cuVSLAM supports all four configurations. For humanoid robots that move quickly and have access to stereo cameras (most modern humanoids do), **stereo + IMU** is the recommended configuration.
+
+---
+
+## 3.4 NVIDIA Jetson Orin: The Target Platform
+
+**NVIDIA Jetson Orin** is the compute module designed for deploying Isaac ROS on real robots. It is a system-on-module (SoM) with:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Jetson AGX Orin (flagship)                                  │
+│  ─────────────────────────────────────────────────────────── │
+│  CPU:    12-core Arm Cortex-A78AE (2.2 GHz)                 │
+│  GPU:    2048-core Ampere GPU                                │
+│  DLA:    2× Deep Learning Accelerators (50 TOPS each)       │
+│  PVA:    2× Programmable Vision Accelerators                │
+│  Memory: 32 GB LPDDR5 (shared CPU+GPU)                      │
+│  Storage:64 GB eMMC + NVMe M.2 slot                        │
+│  I/O:    PCIe Gen4, USB 3.2, CSI (camera), 10GbE           │
+│  Power:  15–60 W (configurable power modes)                 │
+│  Size:   100 × 87 mm (developer kit carrier board)          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+The **DLA (Deep Learning Accelerator)** is a fixed-function neural network engine that runs inference at very low power. TensorRT can compile models to run on the DLA, freeing the GPU for other tasks. This is important for humanoid robots where power budget is tight.
+
+---
+
+## 3.5 Setting Up Isaac ROS on Jetson Orin
+
+### Step 1: Flash JetPack
+
+Isaac ROS requires JetPack 6.0+ (which includes Ubuntu 22.04 + CUDA 12.x).
+
+```bash
+# On your host PC, use NVIDIA SDK Manager (GUI tool):
+# 1. Connect Jetson via USB-C in recovery mode
+# 2. Open SDK Manager
+# 3. Select "Jetson AGX Orin" + "JetPack 6.0"
+# 4. Install OS + all SDK components
+# 5. Reflash takes ~30 minutes
+
+# Alternatively, flash from command line:
+sudo ./flash.sh jetson-agx-orin-devkit mmcblk0p1
+```
+
+### Step 2: Install Isaac ROS using Docker
+
+NVIDIA provides pre-built Docker containers with all Isaac ROS dependencies. This is the recommended installation method.
+
+```bash
+# On Jetson Orin:
+
+# 1. Install Docker (if not present)
+sudo apt update && sudo apt install -y docker.io
+sudo usermod -aG docker $USER
+newgrp docker
+
+# 2. Install NVIDIA Container Toolkit
+distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey \
+    | sudo apt-key add -
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list \
+    | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+sudo apt update && sudo apt install -y nvidia-container-toolkit
+
+# 3. Pull the Isaac ROS container (choose ROS 2 Humble)
+docker pull nvcr.io/nvidia/isaac/ros:aarch64-ros2_humble_b906f96e-2024.02.26
+
+# 4. Create a workspace inside the container
+docker run -it \
+    --runtime=nvidia \
+    --privileged \
+    --network=host \
+    -v /dev:/dev \
+    -v ~/ros2_ws:/workspaces/isaac_ros-dev \
+    nvcr.io/nvidia/isaac/ros:aarch64-ros2_humble_b906f96e-2024.02.26
+```
+
+### Step 3: Build the Isaac ROS VSLAM Package
+
+Inside the container:
+
+```bash
+# Source ROS 2
+source /opt/ros/humble/setup.bash
+
+# Clone Isaac ROS VSLAM
+cd /workspaces/isaac_ros-dev
+git clone --recurse-submodules \
+    https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_visual_slam.git \
+    src/isaac_ros_visual_slam
+
+# Install dependencies
+sudo apt update
+rosdep update
+rosdep install -i -r --from-paths src --rosdistro humble -y
+
+# Build
+colcon build \
+    --symlink-install \
+    --packages-up-to isaac_ros_visual_slam
+
+source install/setup.bash
+```
+
+---
+
+## 3.6 Running cuVSLAM
+
+### Hardware Configuration for Stereo + IMU
+
+cuVSLAM expects the following ROS 2 topics:
+
+| Topic | Message Type | Description |
+|---|---|---|
+| `/stereo_camera/left/image_raw` | `sensor_msgs/Image` | Left camera image |
+| `/stereo_camera/right/image_raw` | `sensor_msgs/Image` | Right camera image |
+| `/stereo_camera/left/camera_info` | `sensor_msgs/CameraInfo` | Left camera intrinsics |
+| `/stereo_camera/right/camera_info` | `sensor_msgs/CameraInfo` | Right camera intrinsics |
+| `/imu/data` (optional) | `sensor_msgs/Imu` | IMU acceleration + gyroscope |
+
+### Launch cuVSLAM
+
+```bash
+ros2 launch isaac_ros_visual_slam isaac_ros_visual_slam_realsense.launch.py
+```
+
+For a custom camera setup:
+
+```python
+# launch/my_vslam.launch.py
+from launch import LaunchDescription
+from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+
+def generate_launch_description():
+    return LaunchDescription([
+
+        Node(
+            package='isaac_ros_visual_slam',
+            executable='visual_slam_node',
+            name='visual_slam',
+            output='screen',
+            parameters=[{
+                # Camera configuration
+                'num_cameras': 2,                    # Stereo
+                'enable_imu_fusion': True,
+                'imu_params_yaml': '',               # Auto-detect
+                'map_frame': 'map',
+                'odom_frame': 'odom',
+                'base_frame': 'base_link',
+
+                # Algorithm tuning
+                'img_jitter_threshold_ms': 34.0,    # Max acceptable time jitter
+                'enable_slam_constraints': True,     # Enable loop closure
+                'max_landmark_count': 1000,          # Memory/accuracy trade-off
+
+                # Visualisation
+                'path_max_size': 1024,               # Max poses in path visualisation
+                'enable_localization_n_mapping': True,
+            }],
+            remappings=[
+                ('stereo_camera/left/image',  '/camera/infra1/image_rect_raw'),
+                ('stereo_camera/right/image', '/camera/infra2/image_rect_raw'),
+                ('stereo_camera/left/camera_info',  '/camera/infra1/camera_info'),
+                ('stereo_camera/right/camera_info', '/camera/infra2/camera_info'),
+                ('/imu', '/camera/imu'),
+            ],
+        ),
+    ])
+```
+
+### cuVSLAM Output Topics
+
+| Topic | Type | Description |
+|---|---|---|
+| `/visual_slam/tracking/odometry` | `nav_msgs/Odometry` | Current pose + velocity estimate |
+| `/visual_slam/tracking/slam_path` | `nav_msgs/Path` | Full trajectory history |
+| `/visual_slam/tracking/vo_path` | `nav_msgs/Path` | Visual odometry-only path |
+| `/visual_slam/map/landmark_points` | `sensor_msgs/PointCloud2` | 3D map of tracked features |
+| `/visual_slam/status` | `isaac_ros_visual_slam_interfaces/VisualSlamStatus` | Tracking confidence |
+
+---
+
+## 3.7 A Full ROS 2 Node that Consumes VSLAM Output
+
+Here is a Python node that subscribes to VSLAM odometry and uses it to track the robot's position history and trigger alerts:
+
+```python
+# vslam_monitor_node.py
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
+from isaac_ros_visual_slam_interfaces.msg import VisualSlamStatus
+import numpy as np
+import math
+
+class VSLAMMonitorNode(Node):
+    """
+    Subscribes to cuVSLAM output and provides:
+    - Pose logging
+    - Displacement calculation
+    - Tracking quality monitoring
+    - Alert publishing when tracking is lost
+    """
+
+    def __init__(self):
+        super().__init__('vslam_monitor')
+
+        # Odometry subscriber
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/visual_slam/tracking/odometry',
+            self.odom_callback,
+            10,
+        )
+
+        # VSLAM status subscriber
+        self.status_sub = self.create_subscription(
+            VisualSlamStatus,
+            '/visual_slam/status',
+            self.status_callback,
+            10,
+        )
+
+        # Alert publisher
+        self.alert_pub = self.create_publisher(String, '/vslam/alert', 10)
+
+        # State
+        self.start_position = None
+        self.current_position = None
+        self.total_distance = 0.0
+        self.tracking_ok = True
+        self.pose_history = []     # List of (x, y, z) tuples
+
+        self.get_logger().info('VSLAM monitor started.')
+
+    def odom_callback(self, msg: Odometry):
+        """Process incoming odometry from cuVSLAM."""
+        pos = msg.pose.pose.position
+        current = np.array([pos.x, pos.y, pos.z])
+
+        # Initialise on first message
+        if self.start_position is None:
+            self.start_position = current.copy()
+            self.get_logger().info(
+                f'VSLAM origin set: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})'
+            )
+
+        # Accumulate distance
+        if self.current_position is not None:
+            step = np.linalg.norm(current - self.current_position)
+            self.total_distance += step
+
+        self.current_position = current
+        self.pose_history.append(tuple(current))
+
+        # Calculate displacement from start
+        displacement = np.linalg.norm(current - self.start_position)
+
+        # Extract yaw from quaternion
+        q = msg.pose.pose.orientation
+        yaw = self._quat_to_yaw(q.x, q.y, q.z, q.w)
+
+        if len(self.pose_history) % 50 == 0:
+            self.get_logger().info(
+                f'Position: ({pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f}) m  '
+                f'Yaw: {math.degrees(yaw):.1f}°  '
+                f'Displacement: {displacement:.2f} m  '
+                f'Total path: {self.total_distance:.2f} m'
+            )
+
+    def status_callback(self, msg: VisualSlamStatus):
+        """
+        Monitor tracking quality.
+        VisualSlamStatus.TRACKING_STATE values:
+          0 = UNKNOWN
+          1 = NOT_INITIALISED
+          2 = OK
+          3 = LOST
+        """
+        state_names = {0: 'UNKNOWN', 1: 'NOT_INITIALISED',
+                       2: 'OK', 3: 'LOST'}
+        state_name = state_names.get(msg.vo_state, 'UNKNOWN')
+
+        was_ok = self.tracking_ok
+        self.tracking_ok = (msg.vo_state == 2)  # 2 = OK
+
+        if was_ok and not self.tracking_ok:
+            self.get_logger().error(f'VSLAM TRACKING LOST! State: {state_name}')
+            alert = String()
+            alert.data = f'VSLAM_LOST:{state_name}'
+            self.alert_pub.publish(alert)
+        elif not was_ok and self.tracking_ok:
+            self.get_logger().info('VSLAM tracking recovered.')
+            alert = String()
+            alert.data = 'VSLAM_RECOVERED'
+            self.alert_pub.publish(alert)
+
+    def _quat_to_yaw(self, x, y, z, w) -> float:
+        """Extract yaw (rotation around Z) from a quaternion."""
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def get_pose_history_as_array(self) -> np.ndarray:
+        """Return the full pose history as an Nx3 numpy array."""
+        return np.array(self.pose_history)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VSLAMMonitorNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        arr = node.get_pose_history_as_array()
+        node.get_logger().info(
+            f'Session ended. Poses recorded: {len(arr)}. '
+            f'Total distance: {node.total_distance:.2f} m'
+        )
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 3.8 Nvblox: Real-Time 3D Mapping
+
+cuVSLAM produces a **sparse** feature point map. For navigation, you need a **dense** occupancy map. **Nvblox** (part of Isaac ROS) converts depth images into a real-time 3D voxel map with a GPU-accelerated Euclidean Signed Distance Function (ESDF):
+
+```
+Depth images + VSLAM poses
+          │
+          ▼
+    ┌─────────────┐
+    │   Nvblox    │     GPU-accelerated TSDF integration
+    │  (GPU voxel │──▶  Occupancy grid (2D slice for Nav2)
+    │   mapping)  │──▶  ESDF (3D distance field for planning)
+    └─────────────┘──▶  Mesh (for visualisation)
+```
+
+### Launching Nvblox
+
+```bash
+ros2 launch nvblox_examples_bringup isaac_sim_example.launch.py
+```
+
+Nvblox publishes:
+- `/nvblox_node/occupancy_layer` — 2D occupancy grid for Nav2
+- `/nvblox_node/esdf_pointcloud` — 3D signed distance field
+- `/nvblox_node/mesh` — triangulated mesh for RViz2 visualisation
+
+---
+
+## 3.9 Camera Calibration: The Prerequisite
+
+cuVSLAM requires accurate camera intrinsic and extrinsic calibration. Poor calibration is the most common cause of VSLAM failure.
+
+### Intrinsic Calibration (per camera)
+
+```bash
+# Use the ROS 2 camera calibration tool with a chessboard
+ros2 run camera_calibration cameracalibrator \
+    --size 8x6 \
+    --square 0.025 \
+    image:=/camera/left/image_raw \
+    camera:=/camera/left
+
+# Output (publish to /camera_info topic):
+# - fx, fy: focal length in pixels
+# - cx, cy: principal point
+# - k1, k2, p1, p2, k3: distortion coefficients
+```
+
+### Extrinsic Calibration (stereo baseline)
+
+```bash
+# Use Kalibr for stereo + IMU calibration
+# (run on collected rosbag data)
+pip install kalibr
+
+kalibr_calibrate_cameras \
+    --bag stereo_calibration.bag \
+    --topics /camera/left/image_raw /camera/right/image_raw \
+    --models pinhole-radtan pinhole-radtan \
+    --target aprilgrid_6x6.yaml
+
+# Output: stereo_calibration_results.yaml
+# - T_left_right: 4x4 transform from right to left camera
+# - baseline: stereo baseline in metres (typically 50-120mm)
+```
+
+---
+
+## 3.10 Performance Tuning on Jetson Orin
+
+### Set Maximum Performance Mode
+
+```bash
+# Enable maximum performance (high power, max clocks)
+sudo nvpmodel -m 0        # Maximum performance mode
+sudo jetson_clocks        # Fix all clocks to maximum
+
+# Verify
+sudo jetson_clocks --show
+```
+
+### Monitor GPU and CPU Utilisation
+
+```bash
+# Real-time system monitor (Jetson-specific)
+sudo jtop
+
+# Check VSLAM latency
+ros2 topic delay /visual_slam/tracking/odometry
+ros2 topic hz /visual_slam/tracking/odometry
+```
+
+### Tuning cuVSLAM for Latency vs Accuracy
+
+```python
+# Low-latency configuration (sacrifice some accuracy)
+parameters=[{
+    'max_landmark_count': 500,       # Fewer landmarks = faster
+    'enable_slam_constraints': False, # Disable loop closure (saves compute)
+    'img_jitter_threshold_ms': 100,  # More tolerant of timing jitter
+}]
+
+# High-accuracy configuration (for mapping tasks)
+parameters=[{
+    'max_landmark_count': 2000,
+    'enable_slam_constraints': True,  # Enable loop closure
+    'img_jitter_threshold_ms': 34,    # Strict timing (30 Hz cameras)
+}]
+```
+
+---
+
+## 3.11 Chapter Summary
+
+This chapter bridged the gap between simulation-based development and real hardware deployment:
+
+1. **Isaac ROS GEM packages** are hardware-accelerated ROS 2 nodes that run algorithms like SLAM, object detection, and depth processing 10–30× faster than CPU implementations.
+
+2. **Visual SLAM** solves localisation and mapping simultaneously using camera images. The pipeline is: feature extraction → matching → motion estimation → pose graph optimisation → loop closure.
+
+3. **cuVSLAM** is NVIDIA's GPU-accelerated V-SLAM implementation. It supports stereo, monocular, RGB-D, and IMU-fused configurations. For humanoids, stereo + IMU is recommended.
+
+4. **Jetson Orin** is the target deployment hardware. It combines a powerful GPU, DLA accelerators, and hardware ISP in a compact, power-efficient module.
+
+5. **Isaac ROS is installed via Docker** containers. The `colcon build --packages-up-to isaac_ros_visual_slam` workflow integrates seamlessly with standard ROS 2 development.
+
+6. **Camera calibration** is a non-negotiable prerequisite. Use the ROS 2 camera calibration tool for intrinsics and Kalibr for stereo + IMU extrinsics.
+
+7. **Nvblox** converts VSLAM pose estimates + depth images into a real-time 3D occupancy map suitable for Nav2 path planning.
+
+---
+
+## Review Questions
+
+1. Explain the difference between Visual Odometry (VO) and full SLAM. What is the role of loop closure, and what failure mode does it prevent?
+
+2. A teammate proposes replacing the stereo + IMU cuVSLAM setup with a single monocular camera to reduce cost and weight on a humanoid robot. What specific problem would arise with monocular-only VSLAM on a robot that occasionally needs to navigate metric distances of 10+ metres?
+
+3. You run `ros2 topic hz /visual_slam/tracking/odometry` on your Jetson Orin and see it outputting at 8 Hz instead of the expected 30 Hz. List four potential causes and how you would diagnose each.
+
+4. Write a Python ROS 2 node that subscribes to `/visual_slam/tracking/odometry` and publishes a `PoseStamped` message to `/robot/current_pose` only when the robot has moved more than 5 cm since the last published pose (to avoid flooding the topic during stationary periods). Include the full class code.
+
+5. Describe the full data path from light entering the stereo camera lenses to the `/visual_slam/tracking/odometry` topic containing the robot's 6-DoF pose. Name every processing step, the hardware that executes it, and the data format at each stage.
