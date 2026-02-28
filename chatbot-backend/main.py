@@ -130,12 +130,11 @@ def _build_messages(
     # Format retrieved chunks
     context_parts: list[str] = []
     for i, chunk in enumerate(context_chunks, 1):
-        header = (
-            f"[{i}] {chunk['source']} — {chunk['title']}"
-            if chunk["title"]
-            else f"[{i}] {chunk['source']}"
-        )
-        context_parts.append(f"{header}\n{chunk['text']}")
+        source = chunk.get("source", "unknown")
+        title = chunk.get("title", "")
+        text = chunk.get("text", "")
+        header = f"[{i}] {source} — {title}" if title else f"[{i}] {source}"
+        context_parts.append(f"{header}\n{text}")
     context_block = "\n\n---\n\n".join(context_parts)
 
     # Build the user message
@@ -219,7 +218,7 @@ async def _chat_core(
 
     # 7. Return
     sources = [
-        {"source": c["source"], "title": c["title"], "score": c["score"]}
+        {"source": c.get("source", "unknown"), "title": c.get("title", ""), "score": c.get("score", 0.0)}
         for c in chunks
     ]
     return ChatResponse(answer=answer, session_id=session_id, sources=sources)
