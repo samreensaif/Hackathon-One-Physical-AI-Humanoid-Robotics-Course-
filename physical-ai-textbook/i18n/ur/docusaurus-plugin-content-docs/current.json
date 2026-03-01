@@ -1,0 +1,22 @@
+{
+  "version.label": {
+    "message": "موجودہ",
+    "description": "The label for the current docs version"
+  },
+  "sidebar.tutorialSidebar.category.Module 1: ROS2": {
+    "message": "ماڈیول 1: ROS 2 بنیادیات",
+    "description": "The label for the Module 1 category in the sidebar"
+  },
+  "sidebar.tutorialSidebar.category.Module 2: Simulation": {
+    "message": "ماڈیول 2: روبوٹ سمولیشن",
+    "description": "The label for the Module 2 category in the sidebar"
+  },
+  "sidebar.tutorialSidebar.category.Module 3: Isaac": {
+    "message": "ماڈیول 3: NVIDIA Isaac",
+    "description": "The label for the Module 3 category in the sidebar"
+  },
+  "sidebar.tutorialSidebar.category.Module 4: VLA": {
+    "message": "ماڈیول 4: VLA ماڈلز",
+    "description": "The label for the Module 4 category in the sidebar"
+  }
+}

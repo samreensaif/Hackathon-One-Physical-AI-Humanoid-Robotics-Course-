@@ -60,6 +60,20 @@ export default function ChatBot() {
           const container = selection.getRangeAt(0).commonAncestorContainer;
           if (chatWindowRef.current.contains(container)) return;
         }
+
+        // T028: If selection is entirely within a <code> element, show tooltip
+        // instead of "Ask about this" — code snippets need prose context
+        if (selection.rangeCount > 0) {
+          const container = selection.getRangeAt(0).commonAncestorContainer;
+          const el = container.nodeType === Node.TEXT_NODE
+            ? container.parentElement
+            : container;
+          if (el && el.closest('code, pre')) {
+            setSelectedText('__code_only__');
+            return;
+          }
+        }
+
         setSelectedText(text);
       } else {
         setSelectedText('');
@@ -151,7 +165,7 @@ export default function ChatBot() {
 
   // ── Ask about the highlighted selection ───────────────────────────────────
   const handleAskAboutSelection = useCallback(() => {
-    if (!selectedText) return;
+    if (!selectedText || selectedText === '__code_only__') return;
     const question =
       input.trim() ||
       `Can you explain this excerpt from the textbook?`;
@@ -176,7 +190,13 @@ export default function ChatBot() {
     <div className={styles.container}>
 
       {/* ── "Ask about this" floating button (shown when text is selected) ── */}
-      {selectedText && (
+      {selectedText === '__code_only__' && (
+        <div className={styles.selectionButton} style={{ cursor: 'default', opacity: 0.7 }}
+          title="Select prose text to ask about">
+          💬 Select prose text to ask about
+        </div>
+      )}
+      {selectedText && selectedText !== '__code_only__' && (
         <button
           className={styles.selectionButton}
           onClick={handleAskAboutSelection}
@@ -259,7 +279,7 @@ export default function ChatBot() {
           </div>
 
           {/* Selected-text context indicator */}
-          {selectedText && (
+          {selectedText && selectedText !== '__code_only__' && (
             <div className={styles.selectionBar}>
               <span className={styles.selectionBarText}>
                 📎 "{selectedText.slice(0, 55)}{selectedText.length > 55 ? '…' : ''}"

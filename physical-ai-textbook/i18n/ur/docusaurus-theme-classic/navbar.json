@@ -1,0 +1,30 @@
+{
+  "title": {
+    "message": "فزیکل اے آئی نصابی کتاب",
+    "description": "The title in the navbar"
+  },
+  "item.label.Tutorial": {
+    "message": "ٹیوٹوریل",
+    "description": "Navbar item with label Tutorial"
+  },
+  "item.label.Blog": {
+    "message": "بلاگ",
+    "description": "Navbar item with label Blog"
+  },
+  "item.label.GitHub": {
+    "message": "گٹ ہب",
+    "description": "Navbar item with label GitHub"
+  },
+  "colorToggle.ariaLabel": {
+    "message": "ڈارک موڈ: {mode}",
+    "description": "Dark/light mode toggle aria label"
+  },
+  "colorToggle.ariaLabel.mode.dark": {
+    "message": "ڈارک موڈ",
+    "description": "Dark mode label"
+  },
+  "colorToggle.ariaLabel.mode.light": {
+    "message": "لائٹ موڈ",
+    "description": "Light mode label"
+  }
+}

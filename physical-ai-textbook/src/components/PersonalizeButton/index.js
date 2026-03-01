@@ -39,7 +39,8 @@ export default function PersonalizeButton() {
           content,
           experience_level: profile.programmingExp || 'Beginner',
           has_gpu: profile.hasGPU === 'Yes',
-          used_ros: profile.usedROS === 'Yes',
+          // T031: ros_experience is now a string enum (none/some/expert)
+          ros_experience: profile.rosExperience || 'none',
           learning_style: profile.learningStyle || 'Reading',
         }),
       });

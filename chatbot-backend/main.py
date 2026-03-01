@@ -118,7 +118,8 @@ class PersonalizeRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=50000)
     experience_level: str = Field(default="Beginner")
     has_gpu: bool = Field(default=False)
-    used_ros: bool = Field(default=False)
+    # T032: ros_experience replaces used_ros (was bool); accepts "none"/"some"/"expert"
+    ros_experience: str = Field(default="none")
     learning_style: str = Field(default="Reading")
 
 
@@ -317,7 +318,7 @@ async def personalize(request: PersonalizeRequest) -> PersonalizeResponse:
         "to this student's background:\n\n"
         f"- Experience level: {request.experience_level}\n"
         f"- Has NVIDIA GPU: {'Yes' if request.has_gpu else 'No'}\n"
-        f"- Has used ROS before: {'Yes' if request.used_ros else 'No'}\n"
+        f"- ROS experience: {request.ros_experience}\n"
         f"- Preferred learning style: {request.learning_style}\n\n"
         "Adaptation rules:\n"
         "• Beginner: simplify jargon, add plain-English explanations before code, "
@@ -329,7 +330,9 @@ async def personalize(request: PersonalizeRequest) -> PersonalizeResponse:
         "• Hands-on learner: lead with code examples and exercises, minimise theory.\n"
         "• Reading learner: favour detailed prose explanations and context.\n"
         "• Has GPU: include GPU-specific commands and tips where relevant.\n"
-        "• Used ROS before: reference familiar ROS 1 concepts when introducing ROS 2.\n\n"
+        "• ROS experience 'none': explain all ROS concepts from scratch.\n"
+        "• ROS experience 'some': reference ROS 1 concepts briefly when introducing ROS 2.\n"
+        "• ROS experience 'expert': assume full ROS 2 proficiency; focus on nuances.\n\n"
         "Preserve all headings and code blocks. Return only the rewritten content."
     )
     try:

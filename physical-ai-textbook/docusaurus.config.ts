@@ -39,9 +39,18 @@ const config: Config = {
   // Even if you don't use internationalization, you can use this field to set
   // useful metadata like html lang. For example, if your site is Chinese, you
   // may want to replace "en" with "zh-Hans".
+  // T044: Add Urdu locale (ur) — RTL support, chapter summaries translated
+  // T048: localeConfigs sets dir="rtl" and lang="ur" on the HTML root
   i18n: {
     defaultLocale: 'en',
-    locales: ['en'],
+    locales: ['en', 'ur'],
+    localeConfigs: {
+      ur: {
+        label: 'اردو',
+        direction: 'rtl',
+        htmlLang: 'ur',
+      },
+    },
   },
 
   presets: [
@@ -53,7 +62,7 @@ const config: Config = {
           // Please change this to your repo.
           // Remove this to remove the "edit this page" links.
           editUrl:
-            'https://github.com/facebook/docusaurus/tree/main/packages/create-docusaurus/templates/shared/',
+            'https://github.com/samreensaif/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/tree/main/physical-ai-textbook/',
         },
         blog: {
           showReadingTime: true,
@@ -61,10 +70,8 @@ const config: Config = {
             type: ['rss', 'atom'],
             xslt: true,
           },
-          // Please change this to your repo.
-          // Remove this to remove the "edit this page" links.
           editUrl:
-            'https://github.com/facebook/docusaurus/tree/main/packages/create-docusaurus/templates/shared/',
+            'https://github.com/samreensaif/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/tree/main/physical-ai-textbook/',
           // Useful options to enforce blogging best practices
           onInlineTags: 'warn',
           onInlineAuthors: 'warn',
@@ -98,8 +105,13 @@ const config: Config = {
         },
         {to: '/blog', label: 'Blog', position: 'left'},
         {
-          href: 'https://github.com/facebook/docusaurus',
+          href: 'https://github.com/samreensaif/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-',
           label: 'GitHub',
+          position: 'right',
+        },
+        // T049: Urdu / English language switcher dropdown
+        {
+          type: 'localeDropdown',
           position: 'right',
         },
         {
@@ -151,7 +163,7 @@ const config: Config = {
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} My Project, Inc. Built with Docusaurus.`,
+      copyright: `Copyright © ${new Date().getFullYear()} Physical AI & Humanoid Robotics Textbook. Built with Docusaurus.`,
     },
     prism: {
       theme: prismThemes.github,

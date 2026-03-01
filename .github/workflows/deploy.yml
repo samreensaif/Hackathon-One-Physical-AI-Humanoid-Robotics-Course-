@@ -38,6 +38,14 @@ jobs:
         run: npm run build
         working-directory: physical-ai-textbook
 
+      # ── Lighthouse CI ─────────────────────────────────────────────────────
+      # Asserts: performance >= 85 (warn), accessibility >= 90 (error)
+      # Config: lighthouserc.json at repo root
+      - name: Run Lighthouse CI
+        run: |
+          npm install -g @lhci/cli@0.14.x
+          lhci autorun
+
       # ── Deploy ────────────────────────────────────────────────────────────
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3

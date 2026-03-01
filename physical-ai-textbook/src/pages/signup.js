@@ -7,24 +7,34 @@ function set(form, setForm, key) {
   return (e) => setForm({ ...form, [key]: e.target.value });
 }
 
+// Options may be plain strings OR objects { value, label }
 function RadioGroup({ name, legend, options, value, onChange }) {
   return (
     <fieldset className={styles.fieldset}>
       <legend className={styles.legend}>{legend}</legend>
-      {options.map((opt) => (
-        <label key={opt} className={styles.radio}>
-          <input
-            type="radio"
-            name={name}
-            value={opt}
-            checked={value === opt}
-            onChange={onChange}
-          />
-          {opt}
-        </label>
-      ))}
+      {options.map((opt) => {
+        const val = typeof opt === 'object' ? opt.value : opt;
+        const lbl = typeof opt === 'object' ? opt.label : opt;
+        return (
+          <label key={val} className={styles.radio}>
+            <input
+              type="radio"
+              name={name}
+              value={val}
+              checked={value === val}
+              onChange={onChange}
+            />
+            {lbl}
+          </label>
+        );
+      })}
     </fieldset>
   );
+}
+
+// T033: Validate email format
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 export default function Signup() {
@@ -35,7 +45,7 @@ export default function Signup() {
     password: '',
     programmingExp: '',
     hasGPU: '',
-    usedROS: '',
+    rosExperience: '',   // T030: replaces usedROS boolean (now "none"/"some"/"expert")
     learningStyle: '',
   });
   const [error, setError] = useState('');
@@ -43,10 +53,15 @@ export default function Signup() {
 
   const update = (key) => set(form, setForm, key);
 
+  // T033: Email format + password length validation
   const handleAccountNext = (e) => {
     e.preventDefault();
     if (!form.name || !form.email || !form.password) {
       setError('All fields are required.');
+      return;
+    }
+    if (!isValidEmail(form.email)) {
+      setError('Please enter a valid email address.');
       return;
     }
     if (form.password.length < 6) {
@@ -57,12 +72,17 @@ export default function Signup() {
     setStep(1);
   };
 
+  // T034: All 4 questions must be answered before submission
+  const onboardingComplete =
+    form.programmingExp && form.hasGPU && form.rosExperience && form.learningStyle;
+
   const handleSignup = (e) => {
     e.preventDefault();
-    if (!form.programmingExp || !form.hasGPU || !form.usedROS || !form.learningStyle) {
+    if (!onboardingComplete) {
       setError('Please answer all questions.');
       return;
     }
+    // T030: Store rosExperience (enum) instead of usedROS (boolean)
     const user = {
       name: form.name,
       email: form.email,
@@ -70,14 +90,15 @@ export default function Signup() {
       profile: {
         programmingExp: form.programmingExp,
         hasGPU: form.hasGPU,
-        usedROS: form.usedROS,
+        rosExperience: form.rosExperience,
         learningStyle: form.learningStyle,
       },
     };
     localStorage.setItem('auth_user', JSON.stringify(user));
     localStorage.setItem('auth_session', JSON.stringify({ email: form.email, name: form.name }));
     setDone(true);
-    setTimeout(() => { window.location.href = '/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/'; }, 1500);
+    // T035: Redirect after showing welcome message
+    setTimeout(() => { window.location.href = '/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/'; }, 2000);
   };
 
   if (done) {
@@ -86,8 +107,8 @@ export default function Signup() {
         <div className={styles.container}>
           <div className={styles.card}>
             <div className={styles.success}>
-              <h2>Welcome, {form.name}!</h2>
-              <p>Your account has been created. Redirecting…</p>
+              <h2>Welcome, {form.name}! 🎉</h2>
+              <p>Your personalized learning path is ready. Redirecting…</p>
             </div>
           </div>
         </div>
@@ -160,12 +181,17 @@ export default function Signup() {
                 value={form.hasGPU}
                 onChange={update('hasGPU')}
               />
+              {/* T029: 3-level ROS experience (replaces Yes/No boolean) */}
               <RadioGroup
-                name="usedROS"
-                legend="Have you used ROS before?"
-                options={['Yes', 'No']}
-                value={form.usedROS}
-                onChange={update('usedROS')}
+                name="rosExperience"
+                legend="ROS experience level"
+                options={[
+                  { value: 'none', label: "None — I've never used ROS" },
+                  { value: 'some', label: "Some — I've dabbled with ROS 1 or ROS 2" },
+                  { value: 'expert', label: "Expert — I'm proficient with ROS 2" },
+                ]}
+                value={form.rosExperience}
+                onChange={update('rosExperience')}
               />
               <RadioGroup
                 name="learningStyle"
@@ -174,6 +200,13 @@ export default function Signup() {
                 value={form.learningStyle}
                 onChange={update('learningStyle')}
               />
+
+              {/* T034: Visual indicator when not all questions answered */}
+              {!onboardingComplete && (
+                <p className={styles.stepLabel} style={{ color: '#888', fontSize: '0.85rem' }}>
+                  ↑ Please answer all questions above to continue
+                </p>
+              )}
 
               {error && <p className={styles.error}>{error}</p>}
 
@@ -185,8 +218,14 @@ export default function Signup() {
                 >
                   ← Back
                 </button>
-                <button className={styles.btn} type="submit">
-                  Create Account
+                {/* T034: Button disabled until all 4 questions are answered */}
+                <button
+                  className={styles.btn}
+                  type="submit"
+                  disabled={!onboardingComplete}
+                  style={{ opacity: onboardingComplete ? 1 : 0.5, cursor: onboardingComplete ? 'pointer' : 'not-allowed' }}
+                >
+                  Complete Setup
                 </button>
               </div>
             </form>

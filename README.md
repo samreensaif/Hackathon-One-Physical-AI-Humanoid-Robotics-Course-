@@ -4,7 +4,7 @@ An open-source, interactive textbook covering the full stack of Physical AI — 
 ROS 2 fundamentals and NVIDIA Isaac simulation through Vision-Language-Action (VLA)
 models — with a built-in RAG-powered AI assistant chatbot.
 
-**Live site:** [YOUR_GITHUB_USERNAME.github.io/physical-ai-textbook](https://YOUR_GITHUB_USERNAME.github.io/physical-ai-textbook/)
+**Live site:** [samreensaif.github.io/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-](https://samreensaif.github.io/Hackathon-One-Physical-AI-Humanoid-Robotics-Course-/)
 
 ---
 
@@ -65,7 +65,15 @@ uvicorn main:app --reload --port 8000
 # Interactive docs at http://localhost:8000/docs
 ```
 
-### 3. Ingest the textbook into Qdrant
+### 3. Run the test suite
+
+```bash
+cd chatbot-backend
+pytest tests/ -v
+# Requires .env to be filled with valid credentials (OPENAI_API_KEY, QDRANT_*, NEON_DATABASE_URL)
+```
+
+### 4. Ingest the textbook into Qdrant
 
 Run this once (and again whenever textbook content changes):
 
@@ -115,7 +123,7 @@ Copy `chatbot-backend/.env.example` to `chatbot-backend/.env` and fill in:
 | `QDRANT_COLLECTION_NAME` | Your choice (default: `textbook_chunks`) | `textbook_chunks` |
 | `NEON_DATABASE_URL` | Neon dashboard → Connection string | `postgresql://user:pass@ep-xxx.neon.tech/neondb?sslmode=require` |
 | `TEXTBOOK_DOCS_PATH` | Path to `physical-ai-textbook/docs/` | `../physical-ai-textbook/docs` |
-| `ALLOWED_ORIGINS` | Comma-separated CORS origins | `http://localhost:3000,https://YOUR_GITHUB_USERNAME.github.io` |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins | `http://localhost:3000,https://samreensaif.github.io` |
 
 ---
 
@@ -125,11 +133,7 @@ The site deploys automatically on every push to `main` via GitHub Actions.
 
 **One-time setup:**
 
-1. Replace `YOUR_GITHUB_USERNAME` in:
-   - `physical-ai-textbook/docusaurus.config.ts` (4 fields: `url`, `organizationName`, `projectName` already set — just swap the placeholder)
-   - This `README.md`
-
-2. Push to GitHub and go to **Settings → Pages** in your repo.
+1. Push to GitHub and go to **Settings → Pages** in your repo.
    Set **Source** to the `gh-pages` branch, root folder.
 
 3. The Actions workflow (`.github/workflows/deploy.yml`) will:
@@ -152,6 +156,8 @@ The site deploys automatically on every push to `main` via GitHub Actions.
 | `POST` | `/ingest` | Re-index all textbook MDX files into Qdrant |
 | `POST` | `/chat` | RAG Q&A — returns answer + source citations |
 | `POST` | `/chat-selected` | Same as `/chat` but includes highlighted text as context |
+| `POST` | `/personalize` | Rewrite chapter content for a user's experience profile |
+| `POST` | `/translate` | Translate text to a target language (e.g. Urdu) |
 | `GET` | `/health` | Liveness check + collection status |
 
 Interactive API docs: `http://localhost:8000/docs`
