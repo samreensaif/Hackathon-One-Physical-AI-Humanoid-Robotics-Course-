@@ -1,19 +1,484 @@
-/**
- * CSS files with the .module.css suffix will be treated as CSS modules
- * and scoped locally.
- */
+/* ── Hero ───────────────────────────────────────────────── */
 
 .heroBanner {
+  position: relative;
+  padding: 7rem 2rem 5rem;
+  background: var(--bg-void);
+  overflow: hidden;
+  text-align: center;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.1);
+}
+
+/* Animated grid */
+.heroBanner::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(0, 212, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 212, 255, 0.04) 1px, transparent 1px);
+  background-size: 60px 60px;
+  animation: gridScroll 20s linear infinite;
+}
+
+/* Radial glow center */
+.heroBanner::after {
+  content: '';
+  position: absolute;
+  top: -20%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 800px;
+  height: 500px;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(0, 212, 255, 0.12) 0%,
+    rgba(0, 102, 255, 0.06) 40%,
+    transparent 70%
+  );
+  pointer-events: none;
+}
+
+@keyframes gridScroll {
+  0% { background-position: 0 0; }
+  100% { background-position: 60px 60px; }
+}
+
+.heroContent {
+  position: relative;
+  z-index: 1;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.heroEyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: 'Space Mono', monospace;
+  font-size: 0.7rem;
+  color: var(--neon-cyan);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  border: 1px solid rgba(0, 212, 255, 0.3);
+  padding: 0.35rem 1rem;
+  border-radius: 100px;
+  margin-bottom: 1.5rem;
+  background: rgba(0, 212, 255, 0.05);
+  animation: fadeInDown 0.6s ease both;
+}
+
+.heroEyebrow::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  background: var(--neon-cyan);
+  border-radius: 50%;
+  animation: pulse 2s ease infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.7); }
+}
+
+.heroTitle {
+  font-family: 'Orbitron', sans-serif !important;
+  font-size: clamp(2rem, 5vw, 3.5rem) !important;
+  font-weight: 900 !important;
+  line-height: 1.1 !important;
+  color: #e8f4ff !important;
+  margin-bottom: 1rem !important;
+  animation: fadeInUp 0.7s ease 0.1s both;
+}
+
+.heroTitleAccent {
+  color: var(--neon-cyan);
+  text-shadow: var(--glow-cyan);
+}
+
+.heroSubtitle {
+  font-size: 1.1rem;
+  color: #7a9abd;
+  max-width: 560px;
+  margin: 0 auto 2.5rem;
+  line-height: 1.7;
+  animation: fadeInUp 0.7s ease 0.2s both;
+}
+
+.heroCta {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  animation: fadeInUp 0.7s ease 0.3s both;
+}
+
+.btnPrimary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.8rem 2rem;
+  background: var(--neon-cyan);
+  color: var(--bg-void) !important;
+  font-family: 'Orbitron', sans-serif;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none !important;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  box-shadow: var(--glow-cyan);
+  transition: all 0.25s;
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+}
+
+.btnPrimary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 0 30px rgba(0, 212, 255, 0.6), 0 0 60px rgba(0, 212, 255, 0.2);
+  background: #1adaff;
+}
+
+.btnSecondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.8rem 2rem;
+  background: transparent;
+  color: var(--neon-cyan) !important;
+  font-family: 'Orbitron', sans-serif;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none !important;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 212, 255, 0.4);
+  cursor: pointer;
+  transition: all 0.25s;
+}
+
+.btnSecondary:hover {
+  background: rgba(0, 212, 255, 0.08);
+  border-color: var(--neon-cyan);
+  box-shadow: var(--glow-subtle);
+}
+
+/* ── Stats bar ──────────────────────────────────────────── */
+
+.statsBar {
+  display: flex;
+  justify-content: center;
+  gap: 3rem;
+  padding: 2rem;
+  background: rgba(0, 212, 255, 0.03);
+  border-bottom: 1px solid rgba(0, 212, 255, 0.08);
+  flex-wrap: wrap;
+}
+
+.statItem {
+  text-align: center;
+}
+
+.statNumber {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: var(--neon-cyan);
+  text-shadow: var(--glow-subtle);
+  display: block;
+}
+
+.statLabel {
+  font-size: 0.72rem;
+  color: #4a6888;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* ── Module grid ────────────────────────────────────────── */
+
+.modulesSection {
+  padding: 5rem 0;
+  background: var(--bg-deep);
+}
+
+.sectionHeader {
+  text-align: center;
+  margin-bottom: 3rem;
+}
+
+.sectionEyebrow {
+  font-family: 'Space Mono', monospace;
+  font-size: 0.68rem;
+  color: var(--neon-cyan);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  margin-bottom: 0.75rem;
+}
+
+.sectionTitle {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: #e8f4ff;
+  margin-bottom: 0.5rem;
+}
+
+.sectionSub {
+  color: #4a6888;
+  font-size: 0.9rem;
+}
+
+.moduleGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1.5rem;
+  padding: 0 1rem;
+}
+
+.moduleCard {
+  background: var(--bg-card);
+  border: 1px solid rgba(0, 212, 255, 0.1);
+  border-radius: 12px;
+  padding: 1.8rem;
+  text-decoration: none !important;
+  display: block;
+  position: relative;
+  overflow: hidden;
+  transition: all 0.3s;
+  cursor: pointer;
+}
+
+.moduleCard::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--card-accent), transparent);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.moduleCard:hover {
+  border-color: rgba(0, 212, 255, 0.3);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 20px rgba(0, 212, 255, 0.08);
+  transform: translateY(-4px);
+}
+
+.moduleCard:hover::before {
+  opacity: 1;
+}
+
+.moduleNumber {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 0.65rem;
+  color: var(--neon-cyan);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 1rem;
+  opacity: 0.7;
+}
+
+.moduleIcon {
+  font-size: 2rem;
+  margin-bottom: 1rem;
+  display: block;
+  filter: drop-shadow(0 0 8px currentColor);
+}
+
+.moduleTitle {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #e8f4ff;
+  margin-bottom: 0.5rem;
+  letter-spacing: 0.02em;
+}
+
+.moduleDesc {
+  font-size: 0.82rem;
+  color: #4a6888;
+  line-height: 1.6;
+  margin-bottom: 1.2rem;
+}
+
+.moduleTopics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.moduleTopic {
+  font-size: 0.68rem;
+  padding: 0.2rem 0.6rem;
+  background: rgba(0, 212, 255, 0.06);
+  border: 1px solid rgba(0, 212, 255, 0.15);
+  border-radius: 100px;
+  color: #4a8aaa;
+  font-family: 'Space Mono', monospace;
+  letter-spacing: 0.02em;
+}
+
+/* ── Personalized section ───────────────────────────────── */
+
+.personalizedSection {
   padding: 4rem 0;
+  background: var(--bg-surface);
+  border-top: 1px solid rgba(0, 212, 255, 0.08);
+}
+
+.ctaCard {
+  background: var(--bg-card);
+  border: 1px solid rgba(0, 212, 255, 0.15);
+  border-radius: 12px;
+  padding: 3rem 2rem;
   text-align: center;
   position: relative;
   overflow: hidden;
+  max-width: 600px;
+  margin: 0 auto;
 }
 
-@media screen and (max-width: 996px) {
-  .heroBanner {
-    padding: 2rem;
-  }
+.ctaCard::before {
+  content: '';
+  position: absolute;
+  top: -100px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 300px;
+  height: 300px;
+  background: radial-gradient(circle, rgba(0, 212, 255, 0.06) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.ctaTitle {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 1.1rem;
+  color: #e8f4ff;
+  margin-bottom: 0.75rem;
+}
+
+.ctaText {
+  color: #4a6888;
+  font-size: 0.9rem;
+  margin-bottom: 1.5rem;
+}
+
+.recommendGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.recommendCard {
+  background: var(--bg-elevated);
+  border: 1px solid rgba(0, 212, 255, 0.1);
+  border-radius: 8px;
+  padding: 1rem;
+  text-decoration: none !important;
+  display: block;
+  transition: all 0.2s;
+}
+
+.recommendCard:hover {
+  border-color: rgba(0, 212, 255, 0.3);
+  background: var(--bg-hover);
+}
+
+.recommendModule {
+  font-size: 0.68rem;
+  color: #4a6888;
+  font-family: 'Space Mono', monospace;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.3rem;
+  text-transform: uppercase;
+}
+
+.recommendTitle {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #c8d8f0;
+}
+
+.gpuBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.65rem;
+  padding: 0.15rem 0.5rem;
+  background: rgba(255, 107, 0, 0.1);
+  border: 1px solid rgba(255, 107, 0, 0.3);
+  border-radius: 100px;
+  color: #ff9a50;
+  margin-left: 0.5rem;
+}
+
+.gpuWarning {
+  background: rgba(255, 107, 0, 0.06);
+  border: 1px solid rgba(255, 107, 0, 0.2);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  font-size: 0.82rem;
+  color: #cc7a40;
+  margin-bottom: 1.5rem;
+}
+
+/* ── Feature highlights ─────────────────────────────────── */
+
+.featuresSection {
+  padding: 5rem 0;
+  background: var(--bg-void);
+  border-top: 1px solid rgba(0, 212, 255, 0.06);
+}
+
+.featureGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1.5rem;
+  padding: 0 1rem;
+}
+
+.featureItem {
+  text-align: center;
+  padding: 2rem 1rem;
+}
+
+.featureIcon {
+  font-size: 2rem;
+  margin-bottom: 1rem;
+  display: block;
+}
+
+.featureName {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #c8d8f0;
+  margin-bottom: 0.5rem;
+  letter-spacing: 0.05em;
+}
+
+.featureDesc {
+  font-size: 0.8rem;
+  color: #4a6888;
+  line-height: 1.5;
+}
+
+/* ── Animations ─────────────────────────────────────────── */
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeInDown {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .buttons {
